@@ -55,6 +55,14 @@ interface UserTradeState {
   consecutiveLossesBySymbol?: Record<string, number>; // Per-symbol loss tracking
   protectiveModeBySymbol?: Record<string, boolean>;  // Per-symbol protective mode
   startingEquity?: number;          // Starting equity for daily loss calculation
+  // Volatility-aware rebuy tracking
+  sellPrices?: Record<string, number>; // Price at which we sold (for reference)
+  lowestPricesAfterSale?: Record<string, number>; // Lowest price seen after sale (for trailing rebuy)
+  // Excess profit tracking (for maximizing gains)
+  excessProfitTracking?: Record<string, {
+    excessProfitStartTime?: number; // Timestamp when profit exceeded threshold by 5-10%
+    excessProfitPercentage?: number; // How much above threshold (5-10%)
+  }>;
 }
 @Injectable()
 export class TradingService {
@@ -75,6 +83,18 @@ export class TradingService {
   private userTradeStates: Map<number, UserTradeState> = new Map();
   private DEFAULT_PROFIT_THRESHOLDS = [1, 3]; // Default profit percentages
   private websocketSubscriptions = new Map<string, Set<number>>(); // symbol -> Set of userIds
+  
+  // BitMart trading fees (Level 1 account)
+  private readonly BITMART_BUY_FEE = 0.0025;  // 0.25% taker fee on buy
+  private readonly BITMART_SELL_FEE = 0.0025; // 0.25% taker fee on sell
+  private readonly TOTAL_FEE_PERCENTAGE = 0.005; // 0.50% total fees per round trip
+  private readonly MIN_PROFIT_AFTER_FEES = 0.00501; // ~0.501% minimum to break even after fees
+  
+  // Excess profit tracking constants (absolute profit percentages, independent of user threshold)
+  // Auto-sell if profit is between 0.65% and 1.0% for 5+ minutes to maximize gains
+  private readonly EXCESS_PROFIT_MIN = 0.0065;  // 0.65% minimum profit
+  private readonly EXCESS_PROFIT_MAX = 0.01;    // 1.0% maximum profit
+  private readonly EXCESS_PROFIT_DURATION_MS = 5 * 60 * 1000; // 5 minutes in milliseconds
   
   // Monitoring intervals (in milliseconds) - optimized for speed while respecting API limits
   // BitMart public endpoints allow ~10-20 requests/second, so:
@@ -871,16 +891,35 @@ export class TradingService {
       }
   
       const purchasePrice = state.purchasePrices[symbol].price;
-      const realizedProfit = (sellPrice - purchasePrice) * quantity;
+      
+      // Calculate profit accounting for BitMart trading fees (0.25% buy + 0.25% sell = 0.50% total)
+      // Buy cost with fee: purchasePrice * quantity * (1 + BITMART_BUY_FEE)
+      // Sell proceeds with fee: sellPrice * quantity * (1 - BITMART_SELL_FEE)
+      // Realized profit = Sell proceeds - Buy cost
+      const buyCostWithFee = purchasePrice * quantity * (1 + this.BITMART_BUY_FEE);
+      const sellProceedsWithFee = sellPrice * quantity * (1 - this.BITMART_SELL_FEE);
+      const realizedProfit = sellProceedsWithFee - buyCostWithFee;
+      
+      // Also calculate gross profit (without fees) for logging
+      const grossProfit = (sellPrice - purchasePrice) * quantity;
+      const feeAmount = buyCostWithFee - (purchasePrice * quantity) + (sellPrice * quantity - sellProceedsWithFee);
 
       // Ensure profit values are calculated correctly
       const roundedProfit = parseFloat(realizedProfit.toFixed(2));
+      const roundedFeeAmount = parseFloat(feeAmount.toFixed(2));
       if (isNaN(roundedProfit)) {
         logger.error(`[checkAndHandleProfit] Invalid profit calculated: ${realizedProfit}`);
         throw new Error("Invalid profit value calculated");
       }
 
-      // Track if this was a profit or loss
+      // Log fee information
+      logger.info(
+        `[Fee Accounting] ${symbol}: Gross profit: ${grossProfit.toFixed(2)} USDT | ` +
+        `Fees: ${roundedFeeAmount.toFixed(2)} USDT (${(this.TOTAL_FEE_PERCENTAGE * 100).toFixed(2)}%) | ` +
+        `Net profit: ${roundedProfit.toFixed(2)} USDT`
+      );
+
+      // Track if this was a profit or loss (using net profit after fees)
       const wasLoss = roundedProfit < 0;
       const wasProfit = roundedProfit > 0;
 
@@ -897,23 +936,36 @@ export class TradingService {
       
       // Update consecutive losses counter (per-symbol only)
       if (wasLoss) {
-        state.consecutiveLossesBySymbol[symbol] = symbolLosses + 1;
+        const newLossCount = symbolLosses + 1;
+        state.consecutiveLossesBySymbol[symbol] = newLossCount;
         state.lastSellResult = 'loss';
         
+        // Calculate loss percentage for better visibility
+        const lossPercentage = ((purchasePrice - sellPrice) / purchasePrice) * 100;
+        
         logger.warn(
-          `[Loss Protection] Loss detected on ${symbol}: ${roundedProfit.toFixed(2)} USDT | ` +
-          `Consecutive losses for ${symbol}: ${state.consecutiveLossesBySymbol[symbol]}`
+          `[Loss Protection] ❌ LOSS DETECTED on ${symbol}: ` +
+          `Loss: ${roundedProfit.toFixed(2)} USDT (${lossPercentage.toFixed(2)}%) | ` +
+          `Buy: $${purchasePrice.toFixed(5)} | Sell: $${sellPrice.toFixed(5)} | ` +
+          `Consecutive losses: ${newLossCount}`
         );
         
-        // Gradient risk reduction based on per-symbol consecutive losses
-        // 1st loss: Reduce position size to 75%
-        // 2nd loss: Reduce to 50%, enter protective mode for this symbol only
-        // 3rd loss: Same as 2nd (can add cooldown if needed)
-        
-        // Per-symbol protective mode after 2 losses on same symbol
-        if (state.consecutiveLossesBySymbol[symbol] >= 2 && !state.protectiveModeBySymbol[symbol]) {
-          state.protectiveModeBySymbol[symbol] = true;
-          logger.warn(`[Loss Protection] ⚠️ PROTECTIVE MODE ACTIVATED for ${symbol} - 2 consecutive losses detected. Bot will be more conservative for this symbol only.`);
+        // Apply gradient risk reduction immediately
+        if (newLossCount === 1) {
+          logger.warn(
+            `[Loss Protection] ⚠️ FIRST LOSS AWARENESS activated for ${symbol} - ` +
+            `Next rebuy will use 75% position size and 1.5x profit threshold`
+          );
+        } else if (newLossCount >= 2) {
+          // Per-symbol protective mode after 2 losses on same symbol
+          if (!state.protectiveModeBySymbol[symbol]) {
+            state.protectiveModeBySymbol[symbol] = true;
+            logger.warn(
+              `[Loss Protection] 🛡️ PROTECTIVE MODE ACTIVATED for ${symbol} - ` +
+              `${newLossCount} consecutive losses detected. ` +
+              `Next rebuy will use 50% position size, 2x profit threshold, and loss rebuy disabled.`
+            );
+          }
         }
       } else if (wasProfit) {
         // Reset consecutive losses on profit (per-symbol only)
@@ -1092,17 +1144,88 @@ export class TradingService {
 
           const purchasePrice = purchase.price;
           const priceChange = ((currentPrice - purchasePrice) / purchasePrice) * 100;
+          const profitThresholdPercent = state.profitCheckThreshold * 100;
+
+          // Initialize excess profit tracking if needed
+          if (!state.excessProfitTracking) {
+            state.excessProfitTracking = {};
+          }
+          if (!state.excessProfitTracking[symbol]) {
+            state.excessProfitTracking[symbol] = {};
+          }
+
+          // Check for excess profit (0.65%-1.0%) for maximizing gains
+          // This triggers when profit is between 0.65% and 1.0% (independent of user's threshold)
+          // Auto-sells to lock in profits before waiting for user's threshold
+          const isInExcessRange = priceChange >= (this.EXCESS_PROFIT_MIN * 100) && 
+                                  priceChange <= (this.EXCESS_PROFIT_MAX * 100);
+          
+          if (isInExcessRange) {
+            // Profit is 0.65%-1.0% - start/continue tracking
+            const now = Date.now();
+            if (!state.excessProfitTracking[symbol].excessProfitStartTime) {
+              // First time entering excess profit range
+              state.excessProfitTracking[symbol].excessProfitStartTime = now;
+              state.excessProfitTracking[symbol].excessProfitPercentage = priceChange;
+              logger.warn(
+                `[Excess Profit Tracking] ${symbol}: Profit ${priceChange.toFixed(2)}% is in excess range ` +
+                `(0.65%-1.0%). Starting 5-minute timer. Will auto-sell if maintained to maximize gains.`
+              );
+            } else {
+              // Already tracking - check if 5 minutes have passed
+              const timeInExcessRange = now - state.excessProfitTracking[symbol].excessProfitStartTime!;
+              const minutesInRange = Math.round(timeInExcessRange / 60000);
+              
+              if (timeInExcessRange >= this.EXCESS_PROFIT_DURATION_MS) {
+                // 5+ minutes in excess profit range - auto-sell to maximize gains
+                logger.warn(
+                  `[Excess Profit Tracking] ${symbol}: Profit ${priceChange.toFixed(2)}% has been in excess range ` +
+                  `(0.65%-1.0%) for ${minutesInRange} minutes. Auto-selling to maximize gains and avoid market drop.`
+                );
+                
+                // Stop continuous monitoring before selling
+                clearInterval(state.monitorIntervals[symbol]);
+                delete state.monitorIntervals[symbol];
+                delete state.excessProfitTracking[symbol];
+                
+                await this.placeOrder(userId, symbol, "sell", quantity);
+                await this.ensureSellCompleted(userId, symbol, quantity);
+                await this.checkAndHandleProfit(userId, symbol, quantity, currentPrice);
+                
+                // Transition to monitoring after sale
+                await this.startMonitoringAfterSale(userId, symbol, rebuyPercentage);
+                return;
+              } else {
+                // Still tracking - log progress
+                const remainingSeconds = Math.round((this.EXCESS_PROFIT_DURATION_MS - timeInExcessRange) / 1000);
+                logger.info(
+                  `[Excess Profit Tracking] ${symbol}: Profit ${priceChange.toFixed(2)}% is in excess range ` +
+                  `(0.65%-1.0%). Time in range: ${minutesInRange}m ${Math.round((timeInExcessRange % 60000) / 1000)}s. ` +
+                  `Auto-sell in ${remainingSeconds}s if maintained.`
+                );
+              }
+            }
+          } else {
+            // Not in excess profit range - reset tracking if it was active
+            if (state.excessProfitTracking[symbol].excessProfitStartTime) {
+              logger.info(
+                `[Excess Profit Tracking] ${symbol}: Profit ${priceChange.toFixed(2)}% no longer in excess range ` +
+                `(0.65%-1.0%). Resetting tracking.`
+              );
+              state.excessProfitTracking[symbol] = {};
+            }
+          }
 
           // Separate profit and loss display with price source
           const statusLog = `${symbol} - Price: ${currentPrice} (${priceSource}) | Buy: ${purchasePrice} | ${
             priceChange >= 0 
               ? `Profit: ${priceChange.toFixed(2)}% | Loss: 0.00%`
               : `Profit: 0.00% | Loss: ${Math.abs(priceChange).toFixed(2)}%`
-          } | Targets: +${(state.profitCheckThreshold * 100).toFixed(2)}% / -${(state.lossCheckThreshold * 100).toFixed(2)}%`;
+          } | Targets: +${profitThresholdPercent.toFixed(2)}% / -${(state.lossCheckThreshold * 100).toFixed(2)}%`;
 
           logger.info(statusLog);
 
-          if (priceChange >= (state.profitCheckThreshold * 100)) {
+          if (priceChange >= profitThresholdPercent) {
             logger.info(`Profit target reached for ${symbol}. Selling.`);
             
             // Stop continuous monitoring before selling
@@ -1168,32 +1291,49 @@ export class TradingService {
     let lossThreshold = userLossThreshold * 100;      // Convert to percentage (0.0035 -> 0.35%)
     
     // Gradient risk reduction based on per-symbol consecutive losses
+    // Apply gradient immediately after first loss (not just in protective mode)
     let positionSizeMultiplier = 1.0; // Normal size
     
-    // Adjust thresholds in protective mode - be more conservative (per-symbol only)
-    if (isSymbolProtectiveMode) {
-      // Gradient based on per-symbol consecutive losses
-      if (symbolLossCount === 1) {
-        // 1st loss: Slightly more conservative (1.5x threshold, 75% position)
-        profitThreshold = profitThreshold * 1.5;
-        positionSizeMultiplier = 0.75;
-      } else if (symbolLossCount >= 2) {
-        // 2+ losses: Full protective mode (2x threshold, 50% position, no loss rebuy)
-        profitThreshold = profitThreshold * 2;
-        positionSizeMultiplier = 0.5;
-        lossThreshold = 999; // Disable loss-based rebuying
-      }
+    // Apply gradient based on consecutive losses (works even before protective mode activates)
+    if (symbolLossCount === 1) {
+      // 1st loss: Slightly more conservative (1.5x threshold, 75% position)
+      profitThreshold = profitThreshold * 1.5;
+      positionSizeMultiplier = 0.75;
+      logger.warn(
+        `[Loss Protection] ⚠️ FIRST LOSS AWARENESS for ${symbol} - ` +
+        `Consecutive losses: 1, ` +
+        `Adjusted thresholds: +${profitThreshold.toFixed(2)}% profit / -${lossThreshold.toFixed(2)}%, ` +
+        `Position size: ${(positionSizeMultiplier * 100).toFixed(0)}% (reduced from 100%)`
+      );
+    } else if (symbolLossCount >= 2) {
+      // 2+ losses: Full protective mode (2x threshold, 50% position, no loss rebuy)
+      profitThreshold = profitThreshold * 2;
+      positionSizeMultiplier = 0.5;
+      lossThreshold = 999; // Disable loss-based rebuying
       
       logger.warn(
         `[Loss Protection] 🛡️ PROTECTIVE MODE ACTIVE for ${symbol} - ` +
         `Consecutive losses: ${symbolLossCount}, ` +
-        `Adjusted thresholds: +${profitThreshold.toFixed(2)}% profit ${lossThreshold >= 999 ? '(loss rebuy disabled)' : `/-${lossThreshold.toFixed(2)}%`}, ` +
-        `Position size: ${(positionSizeMultiplier * 100).toFixed(0)}%`
+        `Adjusted thresholds: +${profitThreshold.toFixed(2)}% profit (loss rebuy disabled), ` +
+        `Position size: ${(positionSizeMultiplier * 100).toFixed(0)}% (reduced from 100%)`
       );
     }
 
     try {
       const initialPrice = await this.fetchTickerWithRetry(symbol);
+      
+      // Initialize volatility tracking if needed
+      if (!state.sellPrices) {
+        state.sellPrices = {};
+      }
+      if (!state.lowestPricesAfterSale) {
+        state.lowestPricesAfterSale = {};
+      }
+      
+      // Store the sell price (initial price after sale)
+      state.sellPrices[symbol] = initialPrice;
+      // Initialize lowest price tracker (starts at initial price)
+      state.lowestPricesAfterSale[symbol] = initialPrice;
       
       // Clear any existing after-sale monitoring first
       if (state.afterSaleMonitorIntervals?.[symbol]) {
@@ -1206,18 +1346,46 @@ export class TradingService {
           const currentPrice = await this.fetchTickerWithRetry(symbol);
           if (!currentPrice || isNaN(currentPrice)) return;
 
-          const priceChange = ((currentPrice - initialPrice) / initialPrice) * 100;
+          // Update lowest price tracker (for volatility-aware rebuy)
+          if (!state.lowestPricesAfterSale) {
+            state.lowestPricesAfterSale = {};
+          }
+          if (currentPrice < (state.lowestPricesAfterSale[symbol] || initialPrice)) {
+            state.lowestPricesAfterSale[symbol] = currentPrice;
+          }
+          
+          const lowestPrice = state.lowestPricesAfterSale[symbol] || initialPrice;
+          const sellPrice = state.sellPrices?.[symbol] || initialPrice;
+          
+          // Calculate price changes
+          const priceChangeFromInitial = ((currentPrice - initialPrice) / initialPrice) * 100;
+          const priceChangeFromLow = ((currentPrice - lowestPrice) / lowestPrice) * 100; // Recovery from low
+          const discountFromSell = ((sellPrice - currentPrice) / sellPrice) * 100; // Discount from sell price
           
           const isSymbolProtective = state.protectiveModeBySymbol?.[symbol] || false;
           const protectiveModeStatus = isSymbolProtective ? ' 🛡️ PROTECTIVE MODE' : '';
           logger.info(
             `After-Sale Monitor ${symbol}${protectiveModeStatus} - Current: ${currentPrice.toFixed(5)} | ` +
-            `Initial: ${initialPrice.toFixed(5)} | Change: ${priceChange.toFixed(2)}% | ` +
-            `Rebuy at: +${profitThreshold.toFixed(2)}% / ${lossThreshold < 999 ? `-${lossThreshold.toFixed(2)}%` : 'loss rebuy disabled'}`
+            `Sell: ${sellPrice.toFixed(5)} | Low: ${lowestPrice.toFixed(5)} | ` +
+            `From sell: ${priceChangeFromInitial.toFixed(2)}% | From low: +${priceChangeFromLow.toFixed(2)}% | ` +
+            `Discount: ${discountFromSell.toFixed(2)}%`
+          );
+
+          // Check rebuy conditions with volatility-aware logic
+          const shouldRebuyNow = this.shouldRebuyVolatilityAware(
+            priceChangeFromInitial,
+            priceChangeFromLow,
+            discountFromSell,
+            profitThreshold,
+            lossThreshold,
+            isSymbolProtective,
+            symbol,
+            state,
+            currentPrice  // Pass current price directly (not from stale state)
           );
 
           // If rebuy conditions met, FIRST clear the interval, THEN execute rebuy
-          if (this.shouldRebuy(priceChange, profitThreshold, lossThreshold)) {
+          if (shouldRebuyNow) {
             // Clear interval BEFORE executing rebuy
             clearInterval(state.afterSaleMonitorIntervals[symbol]);
             delete state.afterSaleMonitorIntervals[symbol];
@@ -1269,21 +1437,23 @@ export class TradingService {
         await new Promise(resolve => setTimeout(resolve, 1000));
       }
 
-      // Check if in protective mode (per-symbol only) - apply gradient risk reduction
-      const isSymbolProtectiveMode = state.protectiveModeBySymbol?.[symbol] || false;
+      // Check consecutive losses and apply gradient risk reduction (works even before protective mode)
       const symbolLossCount = state.consecutiveLossesBySymbol?.[symbol] || 0;
+      const isSymbolProtectiveMode = state.protectiveModeBySymbol?.[symbol] || false;
       
       let effectiveRebuyPercentage = rebuyPercentage;
       let positionSizeMultiplier = 1.0;
       
-      if (isSymbolProtectiveMode) {
-        // Gradient based on per-symbol consecutive losses
-        if (symbolLossCount === 1) {
-          positionSizeMultiplier = 0.75; // 75% position size
-        } else if (symbolLossCount >= 2) {
-          positionSizeMultiplier = 0.5; // 50% position size
-        }
-        
+      // Apply gradient based on consecutive losses (immediately after first loss)
+      if (symbolLossCount === 1) {
+        positionSizeMultiplier = 0.75; // 75% position size after 1st loss
+        effectiveRebuyPercentage = rebuyPercentage * positionSizeMultiplier;
+        logger.warn(
+          `[Loss Protection] ⚠️ First loss awareness for ${symbol}: Reducing rebuy size from ${rebuyPercentage}% to ${effectiveRebuyPercentage.toFixed(1)}% ` +
+          `(${(positionSizeMultiplier * 100).toFixed(0)}% of normal) - 1 consecutive loss`
+        );
+      } else if (symbolLossCount >= 2 || isSymbolProtectiveMode) {
+        positionSizeMultiplier = 0.5; // 50% position size after 2+ losses
         effectiveRebuyPercentage = rebuyPercentage * positionSizeMultiplier;
         logger.warn(
           `[Loss Protection] 🛡️ Protective mode for ${symbol}: Reducing rebuy size from ${rebuyPercentage}% to ${effectiveRebuyPercentage.toFixed(1)}% ` +
@@ -1410,6 +1580,7 @@ public async stopTrade(userId: number): Promise<void> {
     state.accumulatedProfit = 0;
     state.startDayTimestamp = Date.now();
     state.activeTrades = [];
+    state.excessProfitTracking = {}; // Clear excess profit tracking
 
     // Save cleared state
     this.userTrades.set(userId, state);
@@ -1685,6 +1856,8 @@ private initializeTradeState(userId: number): UserTradeState {
     startingEquity: undefined,
     dailyLossLimit: undefined,
     tradingPausedUntil: undefined,
+    sellPrices: {},
+    lowestPricesAfterSale: {},
   };
   this.userTradeStates.set(userId, newState);
   return newState;
@@ -1795,6 +1968,80 @@ public async getUserThresholds(userId: number) {
     }
     // Normal mode: rebuy on profit OR loss threshold
     return priceChange >= profitThreshold || Math.abs(priceChange) >= lossThreshold;
+  }
+
+  /**
+   * Volatility-aware rebuy logic that considers market volatility
+   * In protective mode, allows rebuy on:
+   * 1. Normal profit threshold (if price goes above sell price)
+   * 2. Recovery from lowest point in a new lower regime (catches V-shaped reversals)
+   *    - Requires being in a "new regime" (5-50% below sell price)
+   *    - Requires realistic bounce (3-20% from low)
+   */
+  private shouldRebuyVolatilityAware(
+    priceChangeFromSell: number,      // Change from sell price
+    priceChangeFromLow: number,        // Recovery from lowest point
+    discountFromSell: number,          // Discount from sell price
+    profitThreshold: number,          // Normal profit threshold
+    lossThreshold: number,             // Normal loss threshold
+    isProtectiveMode: boolean,         // Whether in protective mode
+    symbol: string,                   // Symbol for logging
+    state: UserTradeState,            // State for accessing tracking data
+    currentPrice: number              // Current price (passed directly, not from stale state)
+  ): boolean {
+    // Normal mode: standard rebuy logic
+    if (!isProtectiveMode) {
+      return priceChangeFromSell >= profitThreshold || Math.abs(priceChangeFromSell) >= lossThreshold;
+    }
+
+    // Protective mode: volatility-aware rebuy logic
+    // Strategy: Allow rebuy if we can get a better entry OR catch a recovery in a new regime
+    
+    // 1. Normal profit rebuy: Price goes above sell price by threshold
+    if (priceChangeFromSell >= profitThreshold) {
+      this.logger.log(
+        `[Volatility-Aware] ${symbol}: Allowing rebuy on profit threshold ` +
+        `(+${priceChangeFromSell.toFixed(2)}% above sell price)`
+      );
+      return true;
+    }
+
+    // 2. Recovery from low in a new lower regime
+    // This catches V-shaped reversals when coin finds a new trading range below sell price
+    // Requirements:
+    // - Must be in a "new regime" (5-50% below sell price) - not just noise
+    // - Must show realistic bounce (3-20% from low) - not micro noise or FOMO pump
+    
+    const MIN_DISCOUNT_FOR_NEW_REGIME = 5.0;   // Require at least 5% below sell (new regime)
+    const MAX_DISCOUNT_FOR_NEW_REGIME = 50.0;  // Don't touch if nuked more than 50% (might be dead)
+    const MIN_BOUNCE_FROM_LOW = 1.2;           // Require at least 1.2% bounce from low (real recovery)
+    const MAX_BOUNCE_FROM_LOW = 20.0;          // Cap at 20% (avoid FOMO buying after huge pumps)
+    
+    const inNewRegime = discountFromSell >= MIN_DISCOUNT_FOR_NEW_REGIME && 
+                        discountFromSell <= MAX_DISCOUNT_FOR_NEW_REGIME;
+    
+    if (inNewRegime) {
+      // Check if we have a proper bounce from the low
+      if (priceChangeFromLow >= MIN_BOUNCE_FROM_LOW && priceChangeFromLow <= MAX_BOUNCE_FROM_LOW) {
+        // Additional stabilization check: ensure price has recovered from the absolute low
+        const lowestPrice = state.lowestPricesAfterSale?.[symbol];
+        if (lowestPrice) {
+          const recoveryFromLow = ((currentPrice - lowestPrice) / lowestPrice) * 100;
+          // Require at least 0.5% recovery from absolute low (showing stabilization, not free fall)
+          if (recoveryFromLow >= 0.5) {
+            this.logger.log(
+              `[Volatility-Aware] ${symbol}: Allowing rebuy in new regime - ` +
+              `Discount: ${discountFromSell.toFixed(2)}% below sell, ` +
+              `Bounce: +${priceChangeFromLow.toFixed(2)}% from low, ` +
+              `Recovery: +${recoveryFromLow.toFixed(2)}% from absolute low`
+            );
+            return true;
+          }
+        }
+      }
+    }
+
+    return false;
   }
 
   /**
@@ -1951,18 +2198,81 @@ private async processWebSocketPriceUpdate(
   try {
     const purchasePrice = purchase.price;
     const priceChange = ((currentPrice - purchasePrice) / purchasePrice) * 100;
+    const profitThresholdPercent = state.profitCheckThreshold * 100;
+
+    // Initialize excess profit tracking if needed
+    if (!state.excessProfitTracking) {
+      state.excessProfitTracking = {};
+    }
+    if (!state.excessProfitTracking[symbol]) {
+      state.excessProfitTracking[symbol] = {};
+    }
+
+    // Check for excess profit (0.65%-1.0%) for maximizing gains
+    // This triggers when profit is between 0.65% and 1.0% (independent of user's threshold)
+    // Auto-sells to lock in profits before waiting for user's threshold
+    const isInExcessRange = priceChange >= (this.EXCESS_PROFIT_MIN * 100) && 
+                            priceChange <= (this.EXCESS_PROFIT_MAX * 100);
+    
+    if (isInExcessRange) {
+      // Profit is 0.65%-1.0% - start/continue tracking
+      const now = Date.now();
+      if (!state.excessProfitTracking[symbol].excessProfitStartTime) {
+        // First time entering excess profit range
+        state.excessProfitTracking[symbol].excessProfitStartTime = now;
+        state.excessProfitTracking[symbol].excessProfitPercentage = priceChange;
+        logger.warn(
+          `[Excess Profit Tracking] ${symbol}: Profit ${priceChange.toFixed(2)}% is in excess range ` +
+          `(0.65%-1.0%). Starting 5-minute timer. Will auto-sell if maintained to maximize gains.`
+        );
+      } else {
+        // Already tracking - check if 5 minutes have passed
+        const timeInExcessRange = now - state.excessProfitTracking[symbol].excessProfitStartTime!;
+        const minutesInRange = Math.round(timeInExcessRange / 60000);
+        
+        if (timeInExcessRange >= this.EXCESS_PROFIT_DURATION_MS) {
+          // 5+ minutes in excess profit range - auto-sell to maximize gains
+          logger.warn(
+            `[Excess Profit Tracking] ${symbol}: Profit ${priceChange.toFixed(2)}% has been in excess range ` +
+            `(0.65%-1.0%) for ${minutesInRange} minutes. Auto-selling to maximize gains and avoid market drop.`
+          );
+          
+          await this.executeWebSocketSell(userId, symbol, currentPrice, purchase.quantity, purchase.rebuyPercentage);
+          // Clear tracking after sell
+          delete state.excessProfitTracking[symbol];
+          return;
+        } else {
+          // Still tracking - log progress
+          const remainingSeconds = Math.round((this.EXCESS_PROFIT_DURATION_MS - timeInExcessRange) / 1000);
+          logger.info(
+            `[Excess Profit Tracking] ${symbol}: Profit ${priceChange.toFixed(2)}% is in excess range ` +
+            `(0.65%-1.0%). Time in range: ${minutesInRange}m ${Math.round((timeInExcessRange % 60000) / 1000)}s. ` +
+            `Auto-sell in ${remainingSeconds}s if maintained.`
+          );
+        }
+      }
+    } else {
+      // Not in excess profit range - reset tracking if it was active
+      if (state.excessProfitTracking[symbol].excessProfitStartTime) {
+        logger.info(
+          `[Excess Profit Tracking] ${symbol}: Profit ${priceChange.toFixed(2)}% no longer in excess range ` +
+          `(0.65%-1.0%). Resetting tracking.`
+        );
+        state.excessProfitTracking[symbol] = {};
+      }
+    }
 
     // Log price update
     const statusLog = `${symbol} - Price: ${currentPrice} | Buy: ${purchasePrice} | ${
       priceChange >= 0 
         ? `Profit: ${priceChange.toFixed(2)}% | Loss: 0.00%`
         : `Profit: 0.00% | Loss: ${Math.abs(priceChange).toFixed(2)}%`
-    } | Targets: +${(state.profitCheckThreshold * 100).toFixed(2)}% / -${(state.lossCheckThreshold * 100).toFixed(2)}%`;
+    } | Targets: +${profitThresholdPercent.toFixed(2)}% / -${(state.lossCheckThreshold * 100).toFixed(2)}%`;
 
     logger.info(statusLog);
 
     // Check profit/loss conditions
-    if (priceChange >= (state.profitCheckThreshold * 100)) {
+    if (priceChange >= profitThresholdPercent) {
       logger.info(`Profit target reached for ${symbol} via WebSocket. Selling.`);
       await this.executeWebSocketSell(userId, symbol, currentPrice, purchase.quantity, purchase.rebuyPercentage);
     } else if (Math.abs(priceChange) >= (state.lossCheckThreshold * 100)) {
@@ -1992,6 +2302,11 @@ private async executeWebSocketSell(
     if (state.monitorIntervals[symbol]) {
       clearInterval(state.monitorIntervals[symbol]);
       delete state.monitorIntervals[symbol];
+    }
+
+    // Clear excess profit tracking
+    if (state.excessProfitTracking && state.excessProfitTracking[symbol]) {
+      delete state.excessProfitTracking[symbol];
     }
 
     // Place sell order
@@ -2172,18 +2487,89 @@ private async startWebSocketMonitoring(
         // Process the price update to show monitoring logs
         const purchasePrice = purchase.price;
         const priceChange = ((currentPrice - purchasePrice) / purchasePrice) * 100;
+        const profitThresholdPercent = state.profitCheckThreshold * 100;
+
+        // Initialize excess profit tracking if needed
+        if (!state.excessProfitTracking) {
+          state.excessProfitTracking = {};
+        }
+        if (!state.excessProfitTracking[symbol]) {
+          state.excessProfitTracking[symbol] = {};
+        }
+
+        // Check for excess profit (0.65%-1.0%) for maximizing gains
+        // This triggers when profit is between 0.65% and 1.0% (independent of user's threshold)
+        // Auto-sells to lock in profits before waiting for user's threshold
+        const isInExcessRange = priceChange >= (this.EXCESS_PROFIT_MIN * 100) && 
+                                priceChange <= (this.EXCESS_PROFIT_MAX * 100);
+        
+        if (isInExcessRange) {
+          // Profit is 0.65%-1.0% - start/continue tracking
+          const now = Date.now();
+          if (!state.excessProfitTracking[symbol].excessProfitStartTime) {
+            // First time entering excess profit range
+            state.excessProfitTracking[symbol].excessProfitStartTime = now;
+            state.excessProfitTracking[symbol].excessProfitPercentage = priceChange;
+            logger.warn(
+              `[Excess Profit Tracking] ${symbol}: Profit ${priceChange.toFixed(2)}% is in excess range ` +
+              `(0.65%-1.0%). Starting 5-minute timer. Will auto-sell if maintained to maximize gains.`
+            );
+          } else {
+            // Already tracking - check if 5 minutes have passed
+            const timeInExcessRange = now - state.excessProfitTracking[symbol].excessProfitStartTime!;
+            const minutesInRange = Math.round(timeInExcessRange / 60000);
+            
+            if (timeInExcessRange >= this.EXCESS_PROFIT_DURATION_MS) {
+              // 5+ minutes in excess profit range - auto-sell to maximize gains
+              logger.warn(
+                `[Excess Profit Tracking] ${symbol}: Profit ${priceChange.toFixed(2)}% has been in excess range ` +
+                `(0.65%-1.0%) for ${minutesInRange} minutes. Auto-selling to maximize gains and avoid market drop.`
+              );
+              
+              // Stop monitoring before selling
+              clearInterval(state.monitorIntervals[symbol]);
+              delete state.monitorIntervals[symbol];
+              delete state.excessProfitTracking[symbol];
+              
+              await this.placeOrder(userId, symbol, "sell", purchase.quantity);
+              await this.ensureSellCompleted(userId, symbol, purchase.quantity);
+              await this.checkAndHandleProfit(userId, symbol, purchase.quantity, currentPrice);
+              
+              // Transition to monitoring after sale
+              await this.startMonitoringAfterSale(userId, symbol, purchase.rebuyPercentage || rebuyPercentage);
+              return;
+            } else {
+              // Still tracking - log progress
+              const remainingSeconds = Math.round((this.EXCESS_PROFIT_DURATION_MS - timeInExcessRange) / 1000);
+              logger.info(
+                `[Excess Profit Tracking] ${symbol}: Profit ${priceChange.toFixed(2)}% is in excess range ` +
+                `(0.65%-1.0%). Time in range: ${minutesInRange}m ${Math.round((timeInExcessRange % 60000) / 1000)}s. ` +
+                `Auto-sell in ${remainingSeconds}s if maintained.`
+              );
+            }
+          }
+        } else {
+          // Not in excess profit range - reset tracking if it was active
+          if (state.excessProfitTracking[symbol].excessProfitStartTime) {
+            logger.info(
+              `[Excess Profit Tracking] ${symbol}: Profit ${priceChange.toFixed(2)}% no longer in excess range ` +
+              `(0.65%-1.0%). Resetting tracking.`
+            );
+            state.excessProfitTracking[symbol] = {};
+          }
+        }
 
         // Log price update with profit/loss and thresholds
         const statusLog = `${symbol} - Price: ${currentPrice} (${priceSource}) | Buy: ${purchasePrice} | ${
           priceChange >= 0 
             ? `Profit: ${priceChange.toFixed(2)}% | Loss: 0.00%`
             : `Profit: 0.00% | Loss: ${Math.abs(priceChange).toFixed(2)}%`
-        } | Targets: +${(state.profitCheckThreshold * 100).toFixed(2)}% / -${(state.lossCheckThreshold * 100).toFixed(2)}%`;
+        } | Targets: +${profitThresholdPercent.toFixed(2)}% / -${(state.lossCheckThreshold * 100).toFixed(2)}%`;
 
         logger.info(statusLog);
 
         // Check profit/loss conditions and execute sell if needed
-        if (priceChange >= (state.profitCheckThreshold * 100)) {
+        if (priceChange >= profitThresholdPercent) {
           logger.info(`Profit target reached for ${symbol}. Selling.`);
           
           // Stop monitoring before selling
