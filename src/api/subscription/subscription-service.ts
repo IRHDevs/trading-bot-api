@@ -1,6 +1,6 @@
 // src/subscription/subscription.service.ts
 
-import { Injectable, Logger } from "@nestjs/common";
+import { Injectable, Logger, OnModuleInit } from "@nestjs/common";
 import { JsonRpcProvider, Contract, formatUnits } from "ethers";
 import { Cron, CronExpression } from "@nestjs/schedule";
 import { UserRepository } from "../user/user-repository";
@@ -8,7 +8,7 @@ import { EmailService } from "../email/email-service";
 import { User } from "../user/user-entity";
 
 @Injectable()
-export class SubscriptionService {
+export class SubscriptionService implements OnModuleInit {
   private readonly logger = new Logger(SubscriptionService.name);
   private provider: JsonRpcProvider;
   private walletAddress: string;
@@ -52,31 +52,67 @@ export class SubscriptionService {
 
   // ========== 1) Listen for ASC transfers on-chain ==========
   async startListening(): Promise<void> {
-    this.logger.log("SubscriptionService: Listening for ASC transfers...");
+    try {
+      this.logger.log("SubscriptionService: Starting to listen for ASC transfers...");
 
-    const contract = new Contract(
-      this.ascContractAddress,
-      this.ascABI,
-      this.provider,
-    );
+      // Verify provider connection
+      await this.provider.getNetwork();
+      this.logger.log("Provider connection verified");
 
-    contract.on("Transfer", async (from: string, to: string, value: bigint) => {
-      // Check if ASC was sent to our designated wallet
-      if (to.toLowerCase() === this.walletAddress.toLowerCase()) {
-        // Convert BigInt to decimal string (ASC typically 18 decimals)
-        const ascAmount = parseFloat(formatUnits(value, 18));
-        this.logger.log(
-          `Received ASC transfer from ${from}. Amount: ${ascAmount}`,
-        );
+      const contract = new Contract(
+        this.ascContractAddress,
+        this.ascABI,
+        this.provider
+      );
 
-        // Convert ASC amount to approximate USD via Uniswap V3
-        const amountInUSD = await this.getAscValueInUSD(ascAmount);
-        this.logger.log(`Equivalent USD (approx): $${amountInUSD.toFixed(2)}`);
+      // Add error handling for the contract
+      contract.on("error", (error) => {
+        this.logger.error(`Contract event error: ${error.message}`);
+        // Attempt to reconnect
+        this.restartListening();
+      });
 
-        // Attempt to accumulate partial payments
-        await this.handlePartialPayment(from, amountInUSD);
-      }
-    });
+      contract.on("Transfer", async (from: string, to: string, value: bigint) => {
+        try {
+          // Check if ASC was sent to our designated wallet
+          if (to.toLowerCase() === this.walletAddress.toLowerCase()) {
+            const ascAmount = parseFloat(formatUnits(value, 18));
+            this.logger.log(
+              `Received ASC transfer from ${from}. Amount: ${ascAmount}`,
+            );
+
+            const amountInUSD = await this.getAscValueInUSD(ascAmount);
+            this.logger.log(`Equivalent USD (approx): $${amountInUSD.toFixed(2)}`);
+
+            await this.handlePartialPayment(from, amountInUSD);
+          }
+        } catch (error) {
+          this.logger.error(`Error processing transfer event: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      });
+
+      this.logger.log(`Listening for transfers to wallet: ${this.walletAddress}`);
+    } catch (error) {
+      this.logger.error(`Failed to start listening: ${error instanceof Error ? error.message : String(error)}`);
+      // Attempt to restart after delay
+      setTimeout(() => this.restartListening(), 30000);
+    }
+  }
+
+  private async restartListening(): Promise<void> {
+    this.logger.log("Attempting to restart transfer listening...");
+    try {
+      // Reinitialize provider
+      this.provider = new JsonRpcProvider(
+        process.env.ETHEREUM_RPC_URL ||
+          "https://mainnet.infura.io/v3/9de0180f470d430485e9963b80d203f6"
+      );
+      await this.startListening();
+    } catch (error) {
+      this.logger.error(`Failed to restart listening: ${error instanceof Error ? error.message : String(error)}`);
+      // Try again after delay
+      setTimeout(() => this.restartListening(), 30000);
+    }
   }
 
   /**
@@ -439,5 +475,10 @@ export class SubscriptionService {
       this.logger.error(`Error checking subscription status: ${error}`);
       return false;
     }
+  }
+
+  async onModuleInit() {
+    await this.startListening();
+    this.logger.log('Subscription service initialized');
   }
 }

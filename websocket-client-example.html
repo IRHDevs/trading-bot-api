@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trading Bot WebSocket Client</title>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        .status {
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        .connected { background-color: #d4edda; color: #155724; }
+        .disconnected { background-color: #f8d7da; color: #721c24; }
+        .error { background-color: #f8d7da; color: #721c24; }
+        .info { background-color: #d1ecf1; color: #0c5460; }
+        
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin: 20px 0;
+            flex-wrap: wrap;
+        }
+        
+        input, button, select {
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        
+        button {
+            background-color: #007bff;
+            color: white;
+            border: none;
+            cursor: pointer;
+        }
+        
+        button:hover {
+            background-color: #0056b3;
+        }
+        
+        button:disabled {
+            background-color: #6c757d;
+            cursor: not-allowed;
+        }
+        
+        .data-display {
+            background-color: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 4px;
+            padding: 15px;
+            margin: 10px 0;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        
+        .price-data {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }
+        
+        .price-card {
+            background: white;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            padding: 15px;
+            text-align: center;
+        }
+        
+        .price {
+            font-size: 24px;
+            font-weight: bold;
+            color: #28a745;
+        }
+        
+        .change {
+            font-size: 14px;
+            margin-top: 5px;
+        }
+        
+        .positive { color: #28a745; }
+        .negative { color: #dc3545; }
+        
+        .log {
+            background-color: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 4px;
+            padding: 10px;
+            max-height: 300px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚀 Trading Bot WebSocket Client</h1>
+        <p>Real-time market data and trading monitoring</p>
+        
+        <div id="connectionStatus" class="status disconnected">
+            Disconnected
+        </div>
+        
+        <div class="controls">
+            <input type="text" id="tokenInput" placeholder="Enter JWT Token" style="flex: 1; min-width: 200px;">
+            <button id="connectBtn" onclick="connect()">Connect</button>
+            <button id="disconnectBtn" onclick="disconnect()" disabled>Disconnect</button>
+        </div>
+        
+        <div class="controls">
+            <input type="text" id="symbolInput" placeholder="Symbol (e.g., BTC_USDT)" value="BTC_USDT">
+            <button id="subscribeTickerBtn" onclick="subscribeTicker()" disabled>Subscribe Ticker</button>
+            <button id="subscribeTradesBtn" onclick="subscribeTrades()" disabled>Subscribe Trades</button>
+            <button id="subscribeOrderBookBtn" onclick="subscribeOrderBook()" disabled>Subscribe Order Book</button>
+            <button id="unsubscribeBtn" onclick="unsubscribe()" disabled>Unsubscribe</button>
+        </div>
+        
+        <div class="controls">
+            <select id="streamTypeSelect">
+                <option value="ticker">Ticker</option>
+                <option value="trades">Trades</option>
+                <option value="orderbook">Order Book</option>
+            </select>
+            <button id="getStatusBtn" onclick="getConnectionStatus()" disabled>Get Status</button>
+            <button id="getAllConnectionsBtn" onclick="getAllConnections()" disabled>Get All Connections</button>
+        </div>
+    </div>
+    
+    <div class="container">
+        <h3>📊 Real-time Price Data</h3>
+        <div id="priceData" class="price-data">
+            <!-- Price cards will be dynamically added here -->
+        </div>
+    </div>
+    
+    <div class="container">
+        <h3>📝 Event Log</h3>
+        <div id="eventLog" class="log">
+            <!-- Event logs will be displayed here -->
+        </div>
+        <button onclick="clearLog()" style="margin-top: 10px;">Clear Log</button>
+    </div>
+
+    <script>
+        let socket = null;
+        let isConnected = false;
+        let currentSymbol = 'BTC_USDT';
+        let priceData = {};
+
+        function log(message, type = 'info') {
+            const logElement = document.getElementById('eventLog');
+            const timestamp = new Date().toLocaleTimeString();
+            const logEntry = document.createElement('div');
+            logEntry.innerHTML = `<span style="color: #666;">[${timestamp}]</span> ${message}`;
+            logEntry.className = type;
+            logElement.appendChild(logEntry);
+            logElement.scrollTop = logElement.scrollHeight;
+        }
+
+        function updateConnectionStatus(status, message) {
+            const statusElement = document.getElementById('connectionStatus');
+            statusElement.textContent = message;
+            statusElement.className = `status ${status}`;
+        }
+
+        function updateControls(connected) {
+            isConnected = connected;
+            document.getElementById('connectBtn').disabled = connected;
+            document.getElementById('disconnectBtn').disabled = !connected;
+            document.getElementById('subscribeTickerBtn').disabled = !connected;
+            document.getElementById('subscribeTradesBtn').disabled = !connected;
+            document.getElementById('subscribeOrderBookBtn').disabled = !connected;
+            document.getElementById('unsubscribeBtn').disabled = !connected;
+            document.getElementById('getStatusBtn').disabled = !connected;
+            document.getElementById('getAllConnectionsBtn').disabled = !connected;
+        }
+
+        function connect() {
+            const token = document.getElementById('tokenInput').value.trim();
+            if (!token) {
+                alert('Please enter a JWT token');
+                return;
+            }
+
+            log('Connecting to WebSocket...', 'info');
+            
+            socket = io('ws://localhost:3000/trading', {
+                auth: {
+                    token: token
+                }
+            });
+
+            socket.on('connect', () => {
+                log('Connected to WebSocket server', 'connected');
+                updateConnectionStatus('connected', 'Connected');
+                updateControls(true);
+            });
+
+            socket.on('disconnect', () => {
+                log('Disconnected from WebSocket server', 'disconnected');
+                updateConnectionStatus('disconnected', 'Disconnected');
+                updateControls(false);
+            });
+
+            socket.on('connected', (data) => {
+                log(`Successfully authenticated as user ${data.userId}`, 'connected');
+            });
+
+            socket.on('error', (data) => {
+                log(`Error: ${data.message}`, 'error');
+            });
+
+            socket.on('subscribed', (data) => {
+                log(`Subscribed to ${data.type} for ${data.symbol}`, 'info');
+            });
+
+            socket.on('unsubscribed', (data) => {
+                log(`Unsubscribed from ${data.type} for ${data.symbol}`, 'info');
+            });
+
+            socket.on('ticker', (data) => {
+                log(`Ticker update for ${data.symbol}: $${data.data.last_price}`, 'info');
+                updatePriceData(data.symbol, data.data, 'ticker');
+            });
+
+            socket.on('trade', (data) => {
+                log(`Trade update for ${data.symbol}: $${data.data.price} (${data.data.quantity} @ ${data.data.side})`, 'info');
+                updatePriceData(data.symbol, data.data, 'trade');
+            });
+
+            socket.on('orderbook', (data) => {
+                log(`Order book update for ${data.symbol}`, 'info');
+                updatePriceData(data.symbol, data.data, 'orderbook');
+            });
+
+            socket.on('connection_status', (data) => {
+                log(`Connection status for ${data.symbol}: ${data.status}`, 'info');
+            });
+
+            socket.on('all_connections', (data) => {
+                log(`All connections: ${JSON.stringify(data)}`, 'info');
+            });
+        }
+
+        function disconnect() {
+            if (socket) {
+                socket.disconnect();
+                socket = null;
+            }
+        }
+
+        function subscribeTicker() {
+            const symbol = document.getElementById('symbolInput').value.trim();
+            if (!symbol) {
+                alert('Please enter a symbol');
+                return;
+            }
+            currentSymbol = symbol;
+            socket.emit('subscribe_ticker', { symbol: symbol });
+        }
+
+        function subscribeTrades() {
+            const symbol = document.getElementById('symbolInput').value.trim();
+            if (!symbol) {
+                alert('Please enter a symbol');
+                return;
+            }
+            currentSymbol = symbol;
+            socket.emit('subscribe_trades', { symbol: symbol });
+        }
+
+        function subscribeOrderBook() {
+            const symbol = document.getElementById('symbolInput').value.trim();
+            if (!symbol) {
+                alert('Please enter a symbol');
+                return;
+            }
+            currentSymbol = symbol;
+            socket.emit('subscribe_orderbook', { symbol: symbol });
+        }
+
+        function unsubscribe() {
+            const symbol = document.getElementById('symbolInput').value.trim();
+            const streamType = document.getElementById('streamTypeSelect').value;
+            if (!symbol) {
+                alert('Please enter a symbol');
+                return;
+            }
+            socket.emit('unsubscribe', { symbol: symbol, type: streamType });
+        }
+
+        function getConnectionStatus() {
+            const symbol = document.getElementById('symbolInput').value.trim();
+            if (!symbol) {
+                alert('Please enter a symbol');
+                return;
+            }
+            socket.emit('get_connection_status', { symbol: symbol });
+        }
+
+        function getAllConnections() {
+            socket.emit('get_all_connections');
+        }
+
+        function updatePriceData(symbol, data, type) {
+            if (!priceData[symbol]) {
+                priceData[symbol] = {};
+            }
+            
+            priceData[symbol][type] = {
+                ...data,
+                timestamp: Date.now()
+            };
+            
+            renderPriceCards();
+        }
+
+        function renderPriceCards() {
+            const container = document.getElementById('priceData');
+            container.innerHTML = '';
+            
+            Object.keys(priceData).forEach(symbol => {
+                const data = priceData[symbol];
+                
+                if (data.ticker) {
+                    const card = createPriceCard(symbol, data.ticker, 'ticker');
+                    container.appendChild(card);
+                }
+                
+                if (data.trade) {
+                    const card = createPriceCard(symbol, data.trade, 'trade');
+                    container.appendChild(card);
+                }
+            });
+        }
+
+        function createPriceCard(symbol, data, type) {
+            const card = document.createElement('div');
+            card.className = 'price-card';
+            
+            const price = type === 'ticker' ? data.last_price : data.price;
+            const change = type === 'ticker' ? data.change_24h : '0';
+            const volume = type === 'ticker' ? data.volume_24h : data.quantity;
+            
+            card.innerHTML = `
+                <h4>${symbol} (${type})</h4>
+                <div class="price">$${parseFloat(price).toFixed(6)}</div>
+                <div class="change ${parseFloat(change) >= 0 ? 'positive' : 'negative'}">
+                    ${parseFloat(change) >= 0 ? '+' : ''}${parseFloat(change).toFixed(2)}%
+                </div>
+                <div style="font-size: 12px; color: #666; margin-top: 5px;">
+                    Volume: ${parseFloat(volume).toFixed(2)}
+                </div>
+                <div style="font-size: 10px; color: #999; margin-top: 5px;">
+                    ${new Date().toLocaleTimeString()}
+                </div>
+            `;
+            
+            return card;
+        }
+
+        function clearLog() {
+            document.getElementById('eventLog').innerHTML = '';
+        }
+
+        // Initialize
+        updateControls(false);
+        log('WebSocket client ready. Enter your JWT token and click Connect.', 'info');
+    </script>
+</body>
+</html>

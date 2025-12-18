@@ -7,18 +7,21 @@ import { TradingController } from "./controllers";
 import { LogService } from "./log.service";
 import { UserModule } from "./user/user-module";
 import { ApiModule } from "./api-module";
+import { WebSocketModule } from "./websocket/websocket.module";
+import { PriceAggregatorService } from "./price-aggregator.service";
 
 @Module({
   imports: [
     UserModule,
     ApiModule,
+    WebSocketModule,
     JwtModule.register({
       secret: process.env.JWT_SECRET || "your_secret_key", // Replace with your actual secret
       signOptions: { expiresIn: "1h" }, // Optional: Configure expiration
     }),
-  ], // Import UserModule and JwtModule
+  ], // Import UserModule, ApiModule, WebSocketModule and JwtModule
   controllers: [TradingController],
-  providers: [TradingService, AIService, RateLimiterService, LogService],
-  exports: [TradingService, LogService],
+  providers: [TradingService, AIService, RateLimiterService, LogService, PriceAggregatorService],
+  exports: [TradingService, LogService, PriceAggregatorService],
 })
 export class TradingModule {}

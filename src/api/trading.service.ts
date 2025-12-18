@@ -13,6 +13,8 @@ import { getUserLogger } from "./logger"; // Import the logger factory
 import { getTopTrendingCoinsForTheDay } from "./gainer";
 import { UserRepository } from "./user/user-repository";
 import { SymbolHelper } from "./utils/symbol.helper"; // Ensure correct path
+import { WebSocketService } from "./websocket/websocket.service";
+import { PriceAggregatorService } from "./price-aggregator.service";
 
 const BITMART_API_URL = "https://api-cloud.bitmart.com";
 interface PurchaseInfo {
@@ -43,6 +45,16 @@ interface UserTradeState {
   profitThresholds: number[]; // Default thresholds for new trades
   activeTrades: string[];
   afterSaleMonitorIntervals: { [key: string]: NodeJS.Timeout };
+  // Loss protection fields
+  consecutiveLosses: number;        // Track consecutive losing trades
+  protectiveMode: boolean;          // Whether bot is in protective mode
+  lastSellResult: 'profit' | 'loss' | null; // Track last sell result
+  protectiveModeUntil?: number;     // Timestamp when protective mode expires
+  dailyLossLimit?: number;          // Daily loss limit (in USDT, e.g., -3% of starting equity)
+  tradingPausedUntil?: number;      // Timestamp when trading is paused
+  consecutiveLossesBySymbol?: Record<string, number>; // Per-symbol loss tracking
+  protectiveModeBySymbol?: Record<string, boolean>;  // Per-symbol protective mode
+  startingEquity?: number;          // Starting equity for daily loss calculation
 }
 @Injectable()
 export class TradingService {
@@ -62,8 +74,24 @@ export class TradingService {
   private userTrades = new Map<number, UserTradeState>();
   private userTradeStates: Map<number, UserTradeState> = new Map();
   private DEFAULT_PROFIT_THRESHOLDS = [1, 3]; // Default profit percentages
+  private websocketSubscriptions = new Map<string, Set<number>>(); // symbol -> Set of userIds
+  
+  // Monitoring intervals (in milliseconds) - optimized for speed while respecting API limits
+  // BitMart public endpoints allow ~10-20 requests/second, so:
+  // - 2000ms = 30 req/min = 0.5 req/sec (very safe)
+  // - 1000ms = 60 req/min = 1 req/sec (safe)
+  private readonly MONITORING_INTERVAL = parseInt(process.env.MONITORING_INTERVAL_MS || '2000', 10); // Default: 2 seconds
+  private readonly AFTER_SALE_MONITORING_INTERVAL = parseInt(process.env.AFTER_SALE_MONITORING_INTERVAL_MS || '2000', 10); // Default: 2 seconds
+  private readonly BACKUP_API_CHECK_INTERVAL = parseInt(process.env.BACKUP_API_CHECK_INTERVAL_MS || '10000', 10); // Default: 10 seconds
 
-  constructor(private readonly userRepository: UserRepository) {}
+  constructor(
+    private readonly userRepository: UserRepository,
+    private readonly webSocketService: WebSocketService,
+    private readonly priceAggregatorService: PriceAggregatorService
+  ) {
+    // Set up WebSocket event listeners
+    this.setupWebSocketListeners();
+  }
 
   // Load user API keys dynamically
   private async getUserApiKeys(userId: number): Promise<{
@@ -195,7 +223,7 @@ export class TradingService {
       "Content-Type": "application/json",
     };
   }
-  private getUserTradeState(userId: number): UserTradeState {
+  public getUserTradeState(userId: number): UserTradeState {
     let state = this.userTrades.get(userId);
     if (!state) {
       state = this.initializeTradeState(userId);
@@ -358,6 +386,9 @@ export class TradingService {
    * @returns The last traded price.
    */
   private async fetchTicker(symbol: string): Promise<number> {
+    // INTERNAL LOG: Old system usage
+    console.log(`[LEGACY_SYSTEM] 📡 USING OLD BITMART API for ${symbol}`);
+    
     const formattedSymbol = SymbolHelper.toCCXTSymbol(symbol);
     const apiSymbol = symbol;
     const url = `${BITMART_API_URL}/spot/v1/ticker?symbol=${apiSymbol}`;
@@ -375,9 +406,48 @@ export class TradingService {
         throw new Error(`Invalid last price value for symbol: ${symbol}`);
       }
 
+      // INTERNAL LOG: Old system success
+      console.log(`[LEGACY_SYSTEM] ✅ OLD SYSTEM SUCCESS: ${symbol} = $${lastPrice} (BitMart API)`);
+      
       return lastPrice;
     } catch (error: any) {
+      // INTERNAL LOG: Old system error
+      console.log(`[LEGACY_SYSTEM] ❌ OLD SYSTEM ERROR for ${symbol}: ${error.message}`);
       throw new Error(`Failed to fetch ticker data for ${symbol}`);
+    }
+  }
+
+  /**
+   * Fetches real-time price from multiple sources (Binance, CoinGecko, etc.)
+   * @param symbol - The trading symbol in "BASE_QUOTE" format (e.g., "PWC_USDT").
+   * @param userId - The user ID for logging
+   * @returns The aggregated real-time price
+   */
+  public async fetchRealtimePrice(symbol: string, userId?: number): Promise<number> {
+    const logger = userId ? getUserLogger(userId) : this.logger;
+    
+    try {
+      // INTERNAL LOG: Price aggregation system activation
+      console.log(`[PRICE_SYSTEM] 🚀 ACTIVATING MULTI-SOURCE PRICE AGGREGATION for ${symbol} (User: ${userId || 'system'})`);
+      logger.log(`[PRICE_SYSTEM] Fetching real-time price for ${symbol} from multiple sources...`, 'info');
+      
+      // Get aggregated price from multiple sources
+      const priceData = await this.priceAggregatorService.getAggregatedPrice(symbol, userId);
+      
+      // INTERNAL LOG: Success with detailed breakdown
+      console.log(`[PRICE_SYSTEM] ✅ SUCCESS: ${symbol} = $${priceData.price} (Source: ${priceData.source})`);
+      logger.log(`[PRICE_SYSTEM] Real-time price for ${symbol}: $${priceData.price} (from ${priceData.source})`, 'info');
+      
+      return priceData.price;
+    } catch (error) {
+      // INTERNAL LOG: Error in aggregation system
+      console.log(`[PRICE_SYSTEM] ❌ ERROR in multi-source aggregation for ${symbol}: ${(error as Error).message}`);
+      logger.error(`[PRICE_SYSTEM] Failed to fetch real-time price for ${symbol}: ${(error as Error).message}`);
+      
+      // Fallback to BitMart API if aggregation fails
+      console.log(`[PRICE_SYSTEM] 🔄 FALLBACK: Switching to BitMart API for ${symbol}`);
+      logger.log(`[PRICE_SYSTEM] Falling back to BitMart API for ${symbol}`, 'warn');
+      return await this.fetchTicker(symbol);
     }
   }
 
@@ -614,6 +684,14 @@ export class TradingService {
     const state = this.getUserTradeState(userId);
 
     try {
+      // Check if trading is paused (daily loss limit reached)
+      if (state.tradingPausedUntil && Date.now() < state.tradingPausedUntil) {
+        const remainingMinutes = Math.round((state.tradingPausedUntil - Date.now()) / 60000);
+        throw new Error(
+          `Trading is paused due to daily loss limit. Resumes in ${remainingMinutes} minutes. ` +
+          `Daily P&L: ${state.accumulatedProfit.toFixed(2)} USDT`
+        );
+      }
       // Get user's saved thresholds from user entity
       const user = await this.userRepository.findOne({ where: { id: userId } });
       
@@ -661,8 +739,14 @@ export class TradingService {
         profitThresholds: profitThresholds || [...state.profitThresholds]
       });
 
+      // INTERNAL LOG: Price fetching for trade start
+      console.log(`[TRADE_START] 🔍 FETCHING PRICE for trade start: ${symbol}`);
+      
       const lastPrice = await this.fetchTicker(symbol);
       const purchaseQuantity = amount / lastPrice;
+      
+      // INTERNAL LOG: Trade start price confirmation
+      console.log(`[TRADE_START] 💰 TRADE PRICE: ${symbol} = $${lastPrice} (Quantity: ${purchaseQuantity})`);
 
       // Place buy order
       await this.placeOrder(userId, symbol, "buy", amount);
@@ -690,8 +774,8 @@ export class TradingService {
 
       logger.info(`Purchase data saved for ${symbol} at price ${lastPrice}`);
 
-      // Start monitoring
-      await this.startContinuousMonitoring(
+      // Start WebSocket-based monitoring (with API fallback)
+      await this.startWebSocketMonitoring(
         userId,
         symbol,
         purchaseQuantity,
@@ -788,29 +872,122 @@ export class TradingService {
   
       const purchasePrice = state.purchasePrices[symbol].price;
       const realizedProfit = (sellPrice - purchasePrice) * quantity;
-  
+
       // Ensure profit values are calculated correctly
       const roundedProfit = parseFloat(realizedProfit.toFixed(2));
       if (isNaN(roundedProfit)) {
         logger.error(`[checkAndHandleProfit] Invalid profit calculated: ${realizedProfit}`);
         throw new Error("Invalid profit value calculated");
       }
-  
+
+      // Track if this was a profit or loss
+      const wasLoss = roundedProfit < 0;
+      const wasProfit = roundedProfit > 0;
+
+      // Initialize per-symbol tracking if needed
+      if (!state.consecutiveLossesBySymbol) {
+        state.consecutiveLossesBySymbol = {};
+      }
+      if (!state.protectiveModeBySymbol) {
+        state.protectiveModeBySymbol = {};
+      }
+
+      // Track per-symbol losses only (no global tracking)
+      const symbolLosses = (state.consecutiveLossesBySymbol[symbol] || 0);
+      
+      // Update consecutive losses counter (per-symbol only)
+      if (wasLoss) {
+        state.consecutiveLossesBySymbol[symbol] = symbolLosses + 1;
+        state.lastSellResult = 'loss';
+        
+        logger.warn(
+          `[Loss Protection] Loss detected on ${symbol}: ${roundedProfit.toFixed(2)} USDT | ` +
+          `Consecutive losses for ${symbol}: ${state.consecutiveLossesBySymbol[symbol]}`
+        );
+        
+        // Gradient risk reduction based on per-symbol consecutive losses
+        // 1st loss: Reduce position size to 75%
+        // 2nd loss: Reduce to 50%, enter protective mode for this symbol only
+        // 3rd loss: Same as 2nd (can add cooldown if needed)
+        
+        // Per-symbol protective mode after 2 losses on same symbol
+        if (state.consecutiveLossesBySymbol[symbol] >= 2 && !state.protectiveModeBySymbol[symbol]) {
+          state.protectiveModeBySymbol[symbol] = true;
+          logger.warn(`[Loss Protection] ⚠️ PROTECTIVE MODE ACTIVATED for ${symbol} - 2 consecutive losses detected. Bot will be more conservative for this symbol only.`);
+        }
+      } else if (wasProfit) {
+        // Reset consecutive losses on profit (per-symbol only)
+        if (symbolLosses > 0) {
+          logger.info(`[Loss Protection] Profit achieved on ${symbol} (${roundedProfit.toFixed(2)} USDT). Resetting consecutive losses counter for ${symbol}.`);
+        }
+        state.consecutiveLossesBySymbol[symbol] = 0;
+        state.lastSellResult = 'profit';
+        
+        // Exit per-symbol protective mode
+        if (state.protectiveModeBySymbol[symbol]) {
+          state.protectiveModeBySymbol[symbol] = false;
+          logger.info(`[Loss Protection] ✅ Protective mode deactivated for ${symbol} - Profitable trade achieved.`);
+        }
+      }
+
       // Update accumulated profit
       state.accumulatedProfit += roundedProfit;
       state.accumulatedProfit = parseFloat(state.accumulatedProfit.toFixed(2)); // Normalize to two decimals
-  
+
+      // Initialize starting equity on first trade if not set
+      if (!state.startingEquity && state.accumulatedProfit === roundedProfit) {
+        const currentBalance = await this.getUserBalance(userId);
+        state.startingEquity = currentBalance + Math.abs(roundedProfit); // Approximate starting equity
+        logger.info(`[Loss Protection] Starting equity set: ${state.startingEquity.toFixed(2)} USDT`);
+      }
+
+      // Check daily loss limit (e.g., -3% of starting equity)
+      if (state.startingEquity && state.startingEquity > 0) {
+        const dailyLossLimitPercent = -0.03; // -3% default
+        const dailyLossLimit = state.startingEquity * dailyLossLimitPercent;
+        const dailyPnL = state.accumulatedProfit; // Since startDayTimestamp
+        
+        if (dailyPnL <= dailyLossLimit) {
+          const endOfDay = new Date();
+          endOfDay.setHours(23, 59, 59, 999);
+          state.tradingPausedUntil = endOfDay.getTime();
+          
+          logger.error(
+            `[Loss Protection] 🛑 DAILY LOSS LIMIT REACHED - ` +
+            `Daily P&L: ${dailyPnL.toFixed(2)} USDT (${((dailyPnL / state.startingEquity) * 100).toFixed(2)}%) ` +
+            `exceeds limit: ${dailyLossLimit.toFixed(2)} USDT. Trading paused until end of day.`
+          );
+          
+          // Stop all trading
+          await this.stopTrade(userId);
+          this.userTrades.set(userId, state);
+          return;
+        }
+      }
+
+      // Check if trading is paused
+      if (state.tradingPausedUntil && Date.now() < state.tradingPausedUntil) {
+        const remainingMinutes = Math.round((state.tradingPausedUntil - Date.now()) / 60000);
+        logger.warn(`[Loss Protection] Trading is paused. Resumes in ${remainingMinutes} minutes.`);
+        this.userTrades.set(userId, state);
+        return;
+      }
+
       console.log(`[DEBUG][checkAndHandleProfit] Profit calculation:`, {
         purchasePrice,
         sellPrice,
         quantity,
         realizedProfit: roundedProfit,
-        accumulatedProfit: state.accumulatedProfit
+        accumulatedProfit: state.accumulatedProfit,
+        consecutiveLosses: state.consecutiveLosses,
+        protectiveMode: state.protectiveMode,
+        dailyPnL: state.accumulatedProfit,
+        dailyLossLimit: state.startingEquity ? (state.startingEquity * -0.03).toFixed(2) : 'N/A'
       });
-  
+
       // Log updated profit
       logger.info(`Accumulated profit updated for user ${userId}: ${state.accumulatedProfit.toFixed(2)} USDT`);
-  
+
       // Persist the updated state
       this.userTrades.set(userId, state);
   
@@ -855,30 +1032,55 @@ export class TradingService {
     const logger = getUserLogger(userId);
     const state = this.getUserTradeState(userId);
   
-    try {
-      // IMPORTANT: Clear ALL existing monitoring first
-      if (state.afterSaleMonitorIntervals?.[symbol]) {
-        clearInterval(state.afterSaleMonitorIntervals[symbol]);
-        delete state.afterSaleMonitorIntervals[symbol];
-        logger.info(`[startContinuousMonitoring] Forcefully cleared after-sale monitoring for ${symbol}`);
-      }
+  try {
+    // IMPORTANT: Clear ALL existing monitoring first
+    if (state.afterSaleMonitorIntervals?.[symbol]) {
+      clearInterval(state.afterSaleMonitorIntervals[symbol]);
+      delete state.afterSaleMonitorIntervals[symbol];
+      logger.info(`[startContinuousMonitoring] Forcefully cleared after-sale monitoring for ${symbol}`);
+    }
 
-      if (state.monitorIntervals?.[symbol]) {
-        clearInterval(state.monitorIntervals[symbol]);
-        delete state.monitorIntervals[symbol];
-      }
+    // Only clear and restart if monitoring doesn't exist or is different
+    if (state.monitorIntervals?.[symbol]) {
+      logger.warn(`[startContinuousMonitoring] Monitoring already exists for ${symbol}, clearing before restart`);
+      clearInterval(state.monitorIntervals[symbol]);
+      delete state.monitorIntervals[symbol];
+    }
 
-      // Verify monitoring is cleared
-      if (state.afterSaleMonitorIntervals?.[symbol] || state.monitorIntervals?.[symbol]) {
-        logger.warn(`[startContinuousMonitoring] Detected lingering monitors for ${symbol}. Force clearing.`);
-        state.afterSaleMonitorIntervals = {};
-        state.monitorIntervals = {};
-      }
+    // Verify monitoring is cleared
+    if (state.afterSaleMonitorIntervals?.[symbol] || state.monitorIntervals?.[symbol]) {
+      logger.warn(`[startContinuousMonitoring] Detected lingering monitors for ${symbol}. Force clearing.`);
+      state.afterSaleMonitorIntervals = {};
+      state.monitorIntervals = {};
+    }
 
       // Start new monitoring
       state.monitorIntervals[symbol] = setInterval(async () => {
         try {
-          const currentPrice = await this.fetchTicker(symbol);
+          // Try to use WebSocket price first (real-time), but check if it's stale
+          let currentPrice: number;
+          let priceSource: string;
+          const lastWebSocketPrice = state.lastRecordedPrices[symbol];
+          const lastUpdateTime = state.lastRecordedPrices[`${symbol}_timestamp`] || 0;
+          const timeSinceUpdate = Date.now() - lastUpdateTime;
+          const STALE_THRESHOLD = 5000; // Consider WebSocket data stale after 5 seconds
+          
+          // Use WebSocket price only if it exists AND is recent (less than 5 seconds old)
+          if (lastWebSocketPrice && lastWebSocketPrice > 0 && timeSinceUpdate < STALE_THRESHOLD) {
+            currentPrice = lastWebSocketPrice;
+            priceSource = `WebSocket (real-time, ${Math.round(timeSinceUpdate / 1000)}s ago)`;
+          } else {
+            // WebSocket data is stale or missing - fetch fresh from API
+            if (lastWebSocketPrice && timeSinceUpdate >= STALE_THRESHOLD) {
+              logger.warn(`WebSocket data stale for ${symbol} (${Math.round(timeSinceUpdate / 1000)}s old), fetching fresh from API`);
+            }
+            currentPrice = await this.fetchTicker(symbol);
+            priceSource = 'API (fresh)';
+            // Update last recorded price for future use
+            state.lastRecordedPrices[symbol] = currentPrice;
+            state.lastRecordedPrices[`${symbol}_timestamp`] = Date.now();
+          }
+          
           const purchase = state.purchasePrices[symbol];
 
           if (!purchase || purchase.sold) {
@@ -891,8 +1093,8 @@ export class TradingService {
           const purchasePrice = purchase.price;
           const priceChange = ((currentPrice - purchasePrice) / purchasePrice) * 100;
 
-          // Separate profit and loss display
-          const statusLog = `${symbol} - Price: ${currentPrice} | Buy: ${purchasePrice} | ${
+          // Separate profit and loss display with price source
+          const statusLog = `${symbol} - Price: ${currentPrice} (${priceSource}) | Buy: ${purchasePrice} | ${
             priceChange >= 0 
               ? `Profit: ${priceChange.toFixed(2)}% | Loss: 0.00%`
               : `Profit: 0.00% | Loss: ${Math.abs(priceChange).toFixed(2)}%`
@@ -933,11 +1135,11 @@ export class TradingService {
         } catch (error) {
           logger.error(`Error in continuous monitoring for ${symbol}: ${error instanceof Error ? error.message : String(error)}`);
         }
-      }, 5000);
+      }, this.MONITORING_INTERVAL);
 
       // Save clean state
       this.userTrades.set(userId, state);
-      logger.info(`[startContinuousMonitoring] Successfully started new monitoring for ${symbol}`);
+      logger.info(`[startContinuousMonitoring] Successfully started new monitoring for ${symbol} (interval: ${this.MONITORING_INTERVAL}ms)`);
     } catch (error) {
       logger.error(`Failed to start continuous monitoring for ${symbol}: ${error instanceof Error ? error.message : String(error)}`);
       throw error;
@@ -953,9 +1155,42 @@ export class TradingService {
     const state = this.getUserTradeState(userId);
     const user = await this.userRepository.findOne({ where: { id: userId } });
     
+    // Check if protective mode is active (per-symbol only)
+    const isSymbolProtectiveMode = state.protectiveModeBySymbol?.[symbol] || false;
+    const symbolLossCount = state.consecutiveLossesBySymbol?.[symbol] || 0;
+    
     // Get user's configured thresholds or use defaults
-    const profitThreshold = (user?.afterSaleProfitThreshold ?? 0.2) * 100;  // Convert to percentage
-    const lossThreshold = (user?.afterSaleLossThreshold ?? 0.35) * 100;
+    // User thresholds are stored as decimals (0.002 = 0.2%), convert to percentage for comparison
+    const userProfitThreshold = user?.afterSaleProfitThreshold ?? 0.002; // Default 0.2%
+    const userLossThreshold = user?.afterSaleLossThreshold ?? 0.0035; // Default 0.35%
+    
+    let profitThreshold = userProfitThreshold * 100;  // Convert to percentage (0.002 -> 0.2%)
+    let lossThreshold = userLossThreshold * 100;      // Convert to percentage (0.0035 -> 0.35%)
+    
+    // Gradient risk reduction based on per-symbol consecutive losses
+    let positionSizeMultiplier = 1.0; // Normal size
+    
+    // Adjust thresholds in protective mode - be more conservative (per-symbol only)
+    if (isSymbolProtectiveMode) {
+      // Gradient based on per-symbol consecutive losses
+      if (symbolLossCount === 1) {
+        // 1st loss: Slightly more conservative (1.5x threshold, 75% position)
+        profitThreshold = profitThreshold * 1.5;
+        positionSizeMultiplier = 0.75;
+      } else if (symbolLossCount >= 2) {
+        // 2+ losses: Full protective mode (2x threshold, 50% position, no loss rebuy)
+        profitThreshold = profitThreshold * 2;
+        positionSizeMultiplier = 0.5;
+        lossThreshold = 999; // Disable loss-based rebuying
+      }
+      
+      logger.warn(
+        `[Loss Protection] 🛡️ PROTECTIVE MODE ACTIVE for ${symbol} - ` +
+        `Consecutive losses: ${symbolLossCount}, ` +
+        `Adjusted thresholds: +${profitThreshold.toFixed(2)}% profit ${lossThreshold >= 999 ? '(loss rebuy disabled)' : `/-${lossThreshold.toFixed(2)}%`}, ` +
+        `Position size: ${(positionSizeMultiplier * 100).toFixed(0)}%`
+      );
+    }
 
     try {
       const initialPrice = await this.fetchTickerWithRetry(symbol);
@@ -973,10 +1208,12 @@ export class TradingService {
 
           const priceChange = ((currentPrice - initialPrice) / initialPrice) * 100;
           
+          const isSymbolProtective = state.protectiveModeBySymbol?.[symbol] || false;
+          const protectiveModeStatus = isSymbolProtective ? ' 🛡️ PROTECTIVE MODE' : '';
           logger.info(
-            `After-Sale Monitor ${symbol} - Current: ${currentPrice.toFixed(5)} | ` +
+            `After-Sale Monitor ${symbol}${protectiveModeStatus} - Current: ${currentPrice.toFixed(5)} | ` +
             `Initial: ${initialPrice.toFixed(5)} | Change: ${priceChange.toFixed(2)}% | ` +
-            `Rebuy at: +${profitThreshold}% / -${lossThreshold}%`
+            `Rebuy at: +${profitThreshold.toFixed(2)}% / ${lossThreshold < 999 ? `-${lossThreshold.toFixed(2)}%` : 'loss rebuy disabled'}`
           );
 
           // If rebuy conditions met, FIRST clear the interval, THEN execute rebuy
@@ -998,10 +1235,10 @@ export class TradingService {
         } catch (error) {
           logger.error(`Error in after-sale monitoring for ${symbol}: ${error instanceof Error ? error.message : String(error)}`);
         }
-      }, 5000);
+      }, this.AFTER_SALE_MONITORING_INTERVAL);
 
       this.userTrades.set(userId, state);
-      logger.info(`Started after-sale monitoring for ${symbol}`);
+      logger.info(`Started after-sale monitoring for ${symbol} (interval: ${this.AFTER_SALE_MONITORING_INTERVAL}ms)`);
     } catch (error) {
       logger.error(`Failed to start after-sale monitoring for ${symbol}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1032,8 +1269,30 @@ export class TradingService {
         await new Promise(resolve => setTimeout(resolve, 1000));
       }
 
+      // Check if in protective mode (per-symbol only) - apply gradient risk reduction
+      const isSymbolProtectiveMode = state.protectiveModeBySymbol?.[symbol] || false;
+      const symbolLossCount = state.consecutiveLossesBySymbol?.[symbol] || 0;
+      
+      let effectiveRebuyPercentage = rebuyPercentage;
+      let positionSizeMultiplier = 1.0;
+      
+      if (isSymbolProtectiveMode) {
+        // Gradient based on per-symbol consecutive losses
+        if (symbolLossCount === 1) {
+          positionSizeMultiplier = 0.75; // 75% position size
+        } else if (symbolLossCount >= 2) {
+          positionSizeMultiplier = 0.5; // 50% position size
+        }
+        
+        effectiveRebuyPercentage = rebuyPercentage * positionSizeMultiplier;
+        logger.warn(
+          `[Loss Protection] 🛡️ Protective mode for ${symbol}: Reducing rebuy size from ${rebuyPercentage}% to ${effectiveRebuyPercentage.toFixed(1)}% ` +
+          `(${(positionSizeMultiplier * 100).toFixed(0)}% of normal) - ${symbolLossCount} consecutive losses`
+        );
+      }
+
       const availableBalance = await this.getUserBalance(userId);
-      const amountToRebuy = Math.max(5, (availableBalance * rebuyPercentage) / 100);
+      const amountToRebuy = Math.max(5, (availableBalance * effectiveRebuyPercentage) / 100);
 
       if (amountToRebuy <= availableBalance) {
         await this.placeOrder(userId, symbol, "buy", amountToRebuy);
@@ -1138,6 +1397,11 @@ public async stopTrade(userId: number): Promise<void> {
       }
     }
 
+    // Clear WebSocket subscriptions
+    for (const symbol of state.activeTrades) {
+      await this.unsubscribeFromWebSocketData(userId, symbol);
+    }
+
     // Clear all state
     state.monitorIntervals = {};
     state.afterSaleMonitorIntervals = {};
@@ -1184,6 +1448,9 @@ public async stopTrade(userId: number): Promise<void> {
    */
   public getStatus(userId: number): Record<string, any> {
     const state = this.getUserTradeState(userId);
+    const isProtectiveMode = state.protectiveMode && 
+      (!state.protectiveModeUntil || Date.now() < state.protectiveModeUntil);
+    
     return {
       activeTrades: Object.keys(state.purchasePrices).map((symbol) => ({
         symbol,
@@ -1197,7 +1464,48 @@ public async stopTrade(userId: number): Promise<void> {
       activeMonitoringIntervals: Object.keys(state.activeMonitoringIntervals),
       startDayTimestamp: new Date(state.startDayTimestamp).toISOString(),
       payloadLogs: state.payloadLogs,
+      // Loss protection status (per-symbol only)
+      lossProtection: {
+        consecutiveLossesBySymbol: state.consecutiveLossesBySymbol || {},
+        protectiveModeBySymbol: state.protectiveModeBySymbol || {},
+        lastSellResult: state.lastSellResult,
+        dailyPnL: state.accumulatedProfit,
+        startingEquity: state.startingEquity,
+        dailyLossLimit: state.startingEquity ? (state.startingEquity * -0.03).toFixed(2) : null,
+        tradingPausedUntil: state.tradingPausedUntil 
+          ? new Date(state.tradingPausedUntil).toISOString()
+          : null,
+      },
     };
+  }
+
+  /**
+   * Reset loss protection (manually exit protective mode)
+   * @param userId - The user ID
+   * @param symbol - Optional symbol to reset. If not provided, resets all symbols
+   */
+  public resetLossProtection(userId: number, symbol?: string): void {
+    const logger = getUserLogger(userId);
+    const state = this.getUserTradeState(userId);
+    
+    if (symbol) {
+      // Reset specific symbol only
+      if (state.consecutiveLossesBySymbol) {
+        state.consecutiveLossesBySymbol[symbol] = 0;
+      }
+      if (state.protectiveModeBySymbol) {
+        state.protectiveModeBySymbol[symbol] = false;
+      }
+      logger.info(`[Loss Protection] Loss protection reset for ${symbol} by user ${userId}`);
+    } else {
+      // Reset all symbols
+      state.consecutiveLossesBySymbol = {};
+      state.protectiveModeBySymbol = {};
+      state.lastSellResult = null;
+      logger.info(`[Loss Protection] Loss protection reset for all symbols by user ${userId}`);
+    }
+    
+    this.userTrades.set(userId, state);
   }
 /**
  * Sells the specified coin immediately and transitions to monitoring after sale.
@@ -1340,8 +1648,8 @@ public async buyNow(
     // Save state before starting new monitoring
     this.userTrades.set(userId, state);
 
-    // Start continuous monitoring
-    await this.startContinuousMonitoring(userId, symbol, amount / currentPrice, percentage);
+    // Start WebSocket-based monitoring
+    await this.startWebSocketMonitoring(userId, symbol, amount / currentPrice, percentage);
     
     logger.info(`Manual buy executed for ${symbol} - Amount: ${amount} USDT`);
   } catch (error) {
@@ -1367,6 +1675,16 @@ private initializeTradeState(userId: number): UserTradeState {
     profitThresholds: [...this.DEFAULT_PROFIT_THRESHOLDS],
     activeTrades: [],
     afterSaleMonitorIntervals: {},
+    // Loss protection initialization
+    consecutiveLosses: 0,
+    protectiveMode: false,
+    lastSellResult: null,
+    protectiveModeUntil: undefined,
+    consecutiveLossesBySymbol: {},
+    protectiveModeBySymbol: {},
+    startingEquity: undefined,
+    dailyLossLimit: undefined,
+    tradingPausedUntil: undefined,
   };
   this.userTradeStates.set(userId, newState);
   return newState;
@@ -1469,8 +1787,442 @@ public async getUserThresholds(userId: number) {
     afterSaleLossThreshold: user.afterSaleLossThreshold
   };
 }
+  
+  private shouldRebuy(priceChange: number, profitThreshold: number, lossThreshold: number): boolean {
+    // Only rebuy on profit if loss threshold is disabled (protective mode)
+    if (lossThreshold >= 999) {
+      return priceChange >= profitThreshold; // Only rebuy on profit
+    }
+    // Normal mode: rebuy on profit OR loss threshold
+    return priceChange >= profitThreshold || Math.abs(priceChange) >= lossThreshold;
+  }
 
-private shouldRebuy(priceChange: number, profitThreshold: number, lossThreshold: number): boolean {
-  return priceChange >= profitThreshold || Math.abs(priceChange) >= lossThreshold;
+  /**
+   * Debug method to check WebSocket status
+   */
+  public async debugWebSocketStatus(userId: number, symbol: string): Promise<any> {
+    const logger = getUserLogger(userId);
+    const state = this.getUserTradeState(userId);
+    
+    logger.info(`[DEBUG] WebSocket Status Check for ${symbol}:`);
+    logger.info(`[DEBUG] - WebSocket subscriptions: ${JSON.stringify(Array.from(this.websocketSubscriptions.get(symbol) || []))}`);
+    logger.info(`[DEBUG] - Active monitoring intervals: ${Object.keys(state.monitorIntervals)}`);
+    logger.info(`[DEBUG] - After-sale monitoring: ${Object.keys(state.afterSaleMonitorIntervals)}`);
+    
+    return {
+      websocketSubscriptions: Array.from(this.websocketSubscriptions.get(symbol) || []),
+      activeMonitoring: Object.keys(state.monitorIntervals),
+      afterSaleMonitoring: Object.keys(state.afterSaleMonitorIntervals),
+      lastRecordedPrice: state.lastRecordedPrices[symbol]
+    };
+  }
+
+  /**
+   * Ensure WebSocket subscription for price viewing (not trading)
+   */
+  public async ensureWebSocketSubscription(userId: number, symbol: string): Promise<void> {
+    const logger = getUserLogger(userId);
+    
+    try {
+      // Check if already subscribed
+      const userSet = this.websocketSubscriptions.get(symbol);
+      if (userSet && userSet.has(userId)) {
+        logger.info(`Already subscribed to WebSocket data for ${symbol}`);
+        return;
+      }
+
+      // Subscribe to WebSocket data for price viewing
+      await this.subscribeToWebSocketData(userId, symbol);
+      logger.info(`Subscribed to WebSocket data for price viewing: ${symbol}`);
+    } catch (error) {
+      logger.error(`Failed to ensure WebSocket subscription for ${symbol}: ${(error as Error).message}`);
+      // Don't throw error, just log it - price viewing should still work with API fallback
+    }
+  }
+
+/**
+ * Set up WebSocket event listeners for real-time price monitoring
+ */
+private setupWebSocketListeners(): void {
+  this.webSocketService.on('ticker', (symbol: string, tickerData: any) => {
+    this.handleWebSocketTickerUpdate(symbol, tickerData);
+  });
+
+  this.webSocketService.on('trade', (symbol: string, tradeData: any) => {
+    this.handleWebSocketTradeUpdate(symbol, tradeData);
+  });
+
+  this.webSocketService.on('disconnected', (symbol: string) => {
+    this.handleWebSocketDisconnection(symbol);
+  });
+
+  this.webSocketService.on('reconnected', (symbol: string) => {
+    this.handleWebSocketReconnection(symbol);
+  });
+}
+
+  /**
+   * Handle real-time ticker updates from WebSocket
+   */
+  private handleWebSocketTickerUpdate(symbol: string, tickerData: any): void {
+    try {
+      const price = parseFloat(tickerData.last_price);
+      if (isNaN(price)) return;
+
+      // INTERNAL LOG: WebSocket price update
+      const timestamp = Date.now();
+      console.log(`[WEBSOCKET] 📡 REAL-TIME UPDATE: ${symbol} = $${price} (BitMart WebSocket) at ${new Date(timestamp).toISOString()}`);
+
+      // Update last recorded price for all users monitoring this symbol
+      const userIds = this.websocketSubscriptions.get(symbol);
+      if (userIds) {
+        for (const userId of userIds) {
+          const state = this.getUserTradeState(userId);
+          const oldPrice = state.lastRecordedPrices[symbol];
+          state.lastRecordedPrices[symbol] = price;
+          state.lastRecordedPrices[`${symbol}_timestamp`] = timestamp; // Track when price was updated
+          
+          // Log price change if significant
+          if (oldPrice && Math.abs(price - oldPrice) > 0.001) {
+            const logger = getUserLogger(userId);
+            logger.info(`[WebSocket] ${symbol} price updated: $${oldPrice} → $${price} (${((price - oldPrice) / oldPrice * 100).toFixed(3)}%)`);
+          }
+          
+          // Check if this user has active trades for this symbol
+          const purchase = state.purchasePrices[symbol];
+          if (purchase && !purchase.sold) {
+            this.processWebSocketPriceUpdate(userId, symbol, price, purchase);
+          }
+        }
+      }
+    } catch (error) {
+      this.logger.error(`Error handling WebSocket ticker update for ${symbol}: ${(error as Error).message}`);
+    }
+  }
+
+/**
+ * Handle real-time trade updates from WebSocket
+ */
+private handleWebSocketTradeUpdate(symbol: string, tradeData: any): void {
+  try {
+    const price = parseFloat(tradeData.price);
+    if (isNaN(price)) return;
+
+    // Update last recorded price for all users monitoring this symbol
+    const timestamp = Date.now();
+    const userIds = this.websocketSubscriptions.get(symbol);
+    if (userIds) {
+      for (const userId of userIds) {
+        const state = this.getUserTradeState(userId);
+        const oldPrice = state.lastRecordedPrices[symbol];
+        state.lastRecordedPrices[symbol] = price;
+        state.lastRecordedPrices[`${symbol}_timestamp`] = timestamp; // Track when price was updated
+        
+        // Log price change if significant
+        if (oldPrice && Math.abs(price - oldPrice) > 0.001) {
+          const logger = getUserLogger(userId);
+          logger.info(`[WebSocket Trade] ${symbol} price updated: $${oldPrice} → $${price} (${((price - oldPrice) / oldPrice * 100).toFixed(3)}%)`);
+        }
+        
+        // Check if this user has active trades for this symbol
+        const purchase = state.purchasePrices[symbol];
+        if (purchase && !purchase.sold) {
+          this.processWebSocketPriceUpdate(userId, symbol, price, purchase);
+        }
+      }
+    }
+  } catch (error) {
+    this.logger.error(`Error handling WebSocket trade update for ${symbol}: ${(error as Error).message}`);
+  }
+}
+
+/**
+ * Process price updates from WebSocket for trading decisions
+ */
+private async processWebSocketPriceUpdate(
+  userId: number,
+  symbol: string,
+  currentPrice: number,
+  purchase: any
+): Promise<void> {
+  const logger = getUserLogger(userId);
+  const state = this.getUserTradeState(userId);
+
+  try {
+    const purchasePrice = purchase.price;
+    const priceChange = ((currentPrice - purchasePrice) / purchasePrice) * 100;
+
+    // Log price update
+    const statusLog = `${symbol} - Price: ${currentPrice} | Buy: ${purchasePrice} | ${
+      priceChange >= 0 
+        ? `Profit: ${priceChange.toFixed(2)}% | Loss: 0.00%`
+        : `Profit: 0.00% | Loss: ${Math.abs(priceChange).toFixed(2)}%`
+    } | Targets: +${(state.profitCheckThreshold * 100).toFixed(2)}% / -${(state.lossCheckThreshold * 100).toFixed(2)}%`;
+
+    logger.info(statusLog);
+
+    // Check profit/loss conditions
+    if (priceChange >= (state.profitCheckThreshold * 100)) {
+      logger.info(`Profit target reached for ${symbol} via WebSocket. Selling.`);
+      await this.executeWebSocketSell(userId, symbol, currentPrice, purchase.quantity, purchase.rebuyPercentage);
+    } else if (Math.abs(priceChange) >= (state.lossCheckThreshold * 100)) {
+      logger.info(`Loss threshold reached for ${symbol} via WebSocket. Selling.`);
+      await this.executeWebSocketSell(userId, symbol, currentPrice, purchase.quantity, purchase.rebuyPercentage);
+    }
+  } catch (error) {
+    logger.error(`Error processing WebSocket price update for ${symbol}: ${(error as Error).message}`);
+  }
+}
+
+/**
+ * Execute sell order triggered by WebSocket price update
+ */
+private async executeWebSocketSell(
+  userId: number,
+  symbol: string,
+  currentPrice: number,
+  quantity: number,
+  rebuyPercentage: number
+): Promise<void> {
+  const logger = getUserLogger(userId);
+  const state = this.getUserTradeState(userId);
+
+  try {
+    // Stop any existing monitoring intervals
+    if (state.monitorIntervals[symbol]) {
+      clearInterval(state.monitorIntervals[symbol]);
+      delete state.monitorIntervals[symbol];
+    }
+
+    // Place sell order
+    await this.placeOrder(userId, symbol, "sell", quantity);
+    
+    // Ensure sell is completed
+    await this.ensureSellCompleted(userId, symbol, quantity);
+    
+    // Calculate and handle profit
+    await this.checkAndHandleProfit(userId, symbol, quantity, currentPrice);
+    
+    // Start after-sale monitoring
+    await this.startMonitoringAfterSale(userId, symbol, rebuyPercentage);
+    
+    logger.info(`WebSocket-triggered sell completed for ${symbol}`);
+  } catch (error) {
+    logger.error(`Error executing WebSocket sell for ${symbol}: ${(error as Error).message}`);
+  }
+}
+
+/**
+ * Handle WebSocket disconnection
+ */
+private handleWebSocketDisconnection(symbol: string): void {
+  this.logger.warn(`WebSocket disconnected for ${symbol}, falling back to API polling`);
+  
+  // Fall back to API polling for affected users
+  const userIds = this.websocketSubscriptions.get(symbol);
+  if (userIds) {
+    for (const userId of userIds) {
+      const state = this.getUserTradeState(userId);
+      const purchase = state.purchasePrices[symbol];
+      
+      if (purchase && !purchase.sold) {
+        // Only start continuous monitoring if it's not already running
+        if (!state.monitorIntervals[symbol]) {
+          this.logger.log(`Starting API polling fallback for ${symbol} (user ${userId})`);
+          this.startContinuousMonitoring(userId, symbol, purchase.quantity, purchase.rebuyPercentage || 5).catch(error => {
+            this.logger.error(`Failed to start continuous monitoring fallback for ${symbol}: ${(error as Error).message}`);
+          });
+        } else {
+          this.logger.log(`API polling already running for ${symbol} (user ${userId}), skipping restart`);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Handle WebSocket reconnection
+ */
+private handleWebSocketReconnection(symbol: string): void {
+  this.logger.log(`WebSocket reconnected for ${symbol}, switching back to real-time monitoring`);
+  
+  // Stop API polling and switch back to WebSocket monitoring
+  const userIds = this.websocketSubscriptions.get(symbol);
+  if (userIds) {
+    for (const userId of userIds) {
+      const state = this.getUserTradeState(userId);
+      
+      // Stop continuous monitoring intervals (API polling fallback)
+      if (state.monitorIntervals[symbol]) {
+        clearInterval(state.monitorIntervals[symbol]);
+        delete state.monitorIntervals[symbol];
+        this.logger.log(`Stopped API polling for ${symbol} (user ${userId}), using WebSocket data`);
+      }
+    }
+  }
+}
+
+/**
+ * Subscribe to WebSocket data for a symbol
+ */
+private async subscribeToWebSocketData(userId: number, symbol: string): Promise<void> {
+  try {
+    // Add user to subscription tracking
+    if (!this.websocketSubscriptions.has(symbol)) {
+      this.websocketSubscriptions.set(symbol, new Set());
+    }
+    this.websocketSubscriptions.get(symbol)!.add(userId);
+
+    // Subscribe to ticker and trade data
+    await this.webSocketService.subscribeToTicker(symbol, userId);
+    await this.webSocketService.subscribeToTrades(symbol, userId);
+    
+    this.logger.log(`Subscribed to WebSocket data for ${symbol} (user ${userId})`);
+  } catch (error) {
+    this.logger.error(`Failed to subscribe to WebSocket data for ${symbol}: ${(error as Error).message}`);
+    throw error;
+  }
+}
+
+/**
+ * Unsubscribe from WebSocket data for a symbol
+ */
+private async unsubscribeFromWebSocketData(userId: number, symbol: string): Promise<void> {
+  try {
+    // Remove user from subscription tracking
+    const userSet = this.websocketSubscriptions.get(symbol);
+    if (userSet) {
+      userSet.delete(userId);
+      
+      // If no more users are subscribed, unsubscribe from WebSocket
+      if (userSet.size === 0) {
+        await this.webSocketService.unsubscribe(symbol, 'ticker', userId);
+        await this.webSocketService.unsubscribe(symbol, 'trades', userId);
+        this.websocketSubscriptions.delete(symbol);
+      }
+    }
+    
+    this.logger.log(`Unsubscribed from WebSocket data for ${symbol} (user ${userId})`);
+  } catch (error) {
+    this.logger.error(`Failed to unsubscribe from WebSocket data for ${symbol}: ${(error as Error).message}`);
+  }
+}
+
+/**
+ * Start WebSocket-based continuous monitoring
+ */
+private async startWebSocketMonitoring(
+  userId: number,
+  symbol: string,
+  quantity: number,
+  rebuyPercentage: number
+): Promise<void> {
+  const logger = getUserLogger(userId);
+  const state = this.getUserTradeState(userId);
+
+  try {
+    // Clear any existing API polling monitoring (but keep WebSocket subscription)
+    if (state.monitorIntervals[symbol]) {
+      clearInterval(state.monitorIntervals[symbol]);
+      delete state.monitorIntervals[symbol];
+      logger.debug(`Cleared API polling interval for ${symbol} before starting WebSocket`);
+    }
+
+    // Subscribe to WebSocket data
+    await this.subscribeToWebSocketData(userId, symbol);
+    
+    logger.info(`Started WebSocket-based monitoring for ${symbol} (real-time price updates, backup check: ${this.BACKUP_API_CHECK_INTERVAL}ms)`);
+    
+    // Also start a backup API polling interval to ensure we have price data
+    // This acts as a safety net if WebSocket data is delayed or connection is broken
+    // Check more frequently (every 5 seconds) to catch stale data quickly
+    const BACKUP_CHECK_INTERVAL = 5000; // Check every 5 seconds for stale data
+    state.monitorIntervals[symbol] = setInterval(async () => {
+      try {
+        const purchase = state.purchasePrices[symbol];
+        if (!purchase || purchase.sold) {
+          // No active trade, stop monitoring
+          clearInterval(state.monitorIntervals[symbol]);
+          delete state.monitorIntervals[symbol];
+          return;
+        }
+
+        const lastWebSocketPrice = state.lastRecordedPrices[symbol];
+        const lastUpdateTime = state.lastRecordedPrices[`${symbol}_timestamp`] || 0;
+        const timeSinceUpdate = Date.now() - lastUpdateTime;
+        const STALE_THRESHOLD = 5000; // Consider stale after 5 seconds
+        
+        let currentPrice: number;
+        let priceSource: string;
+        
+        // If WebSocket data is missing or stale, fetch fresh from API
+        if (!lastWebSocketPrice || timeSinceUpdate > STALE_THRESHOLD) {
+          const ageSeconds = Math.round(timeSinceUpdate / 1000);
+          logger.debug(`[WebSocket Backup] Data stale/missing for ${symbol} (${ageSeconds}s old), fetching fresh from API`);
+          currentPrice = await this.fetchTicker(symbol);
+          state.lastRecordedPrices[symbol] = currentPrice;
+          state.lastRecordedPrices[`${symbol}_timestamp`] = Date.now();
+          priceSource = 'API (fresh)';
+        } else {
+          // Use fresh WebSocket data
+          currentPrice = lastWebSocketPrice;
+          priceSource = 'WebSocket (real-time)';
+        }
+
+        // Process the price update to show monitoring logs
+        const purchasePrice = purchase.price;
+        const priceChange = ((currentPrice - purchasePrice) / purchasePrice) * 100;
+
+        // Log price update with profit/loss and thresholds
+        const statusLog = `${symbol} - Price: ${currentPrice} (${priceSource}) | Buy: ${purchasePrice} | ${
+          priceChange >= 0 
+            ? `Profit: ${priceChange.toFixed(2)}% | Loss: 0.00%`
+            : `Profit: 0.00% | Loss: ${Math.abs(priceChange).toFixed(2)}%`
+        } | Targets: +${(state.profitCheckThreshold * 100).toFixed(2)}% / -${(state.lossCheckThreshold * 100).toFixed(2)}%`;
+
+        logger.info(statusLog);
+
+        // Check profit/loss conditions and execute sell if needed
+        if (priceChange >= (state.profitCheckThreshold * 100)) {
+          logger.info(`Profit target reached for ${symbol}. Selling.`);
+          
+          // Stop monitoring before selling
+          clearInterval(state.monitorIntervals[symbol]);
+          delete state.monitorIntervals[symbol];
+          
+          await this.placeOrder(userId, symbol, "sell", purchase.quantity);
+          await this.ensureSellCompleted(userId, symbol, purchase.quantity);
+          await this.checkAndHandleProfit(userId, symbol, purchase.quantity, currentPrice);
+          
+          // Transition to monitoring after sale
+          await this.startMonitoringAfterSale(userId, symbol, purchase.rebuyPercentage || rebuyPercentage);
+          return;
+        } else if (Math.abs(priceChange) >= (state.lossCheckThreshold * 100)) {
+          logger.info(`Loss threshold reached for ${symbol}. Selling.`);
+          
+          // Stop monitoring before selling
+          clearInterval(state.monitorIntervals[symbol]);
+          delete state.monitorIntervals[symbol];
+          
+          await this.placeOrder(userId, symbol, "sell", purchase.quantity);
+          await this.ensureSellCompleted(userId, symbol, purchase.quantity);
+          await this.checkAndHandleProfit(userId, symbol, purchase.quantity, currentPrice);
+          
+          // Transition to monitoring after sale
+          await this.startMonitoringAfterSale(userId, symbol, purchase.rebuyPercentage || rebuyPercentage);
+          return;
+        }
+      } catch (error) {
+        logger.error(`Error in backup price check for ${symbol}: ${(error as Error).message}`);
+      }
+    }, BACKUP_CHECK_INTERVAL);
+    
+  } catch (error) {
+    logger.error(`Failed to start WebSocket monitoring for ${symbol}: ${(error as Error).message}`);
+    
+    // Fall back to API polling
+    logger.warn(`Falling back to API polling for ${symbol} (WebSocket unavailable)`);
+    await this.startContinuousMonitoring(userId, symbol, quantity, rebuyPercentage);
+  }
 }
 }

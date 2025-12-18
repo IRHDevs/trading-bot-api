@@ -63,6 +63,105 @@ export class TradingController {
     }
   }
 
+  @Get("realtime-ticker")
+  @UseGuards(AuthGuard)
+  async getRealtimeTicker(
+    @Query("symbol") symbol: string,
+    @Req() req: RequestWithUser
+  ): Promise<any> {
+    console.log("Received request for real-time ticker with symbol:", symbol);
+    if (!symbol) {
+      console.error("Error: Symbol query parameter is required");
+      throw new Error("Symbol query parameter is required");
+    }
+    try {
+      if (!req.user) {
+        throw new Error("User not authenticated");
+      }
+      
+      // Ensure WebSocket subscription for this symbol
+      await this.tradingService.ensureWebSocketSubscription(req.user.id, symbol);
+      
+      // Get real-time price from WebSocket data, but check if it's stale
+      const state = this.tradingService.getUserTradeState(req.user.id);
+      const lastRecordedPrice = state.lastRecordedPrices[symbol];
+      const lastUpdateTime = state.lastRecordedPrices[`${symbol}_timestamp`] || 0;
+      const timeSinceUpdate = Date.now() - lastUpdateTime;
+      const STALE_THRESHOLD = 5000; // Consider stale after 5 seconds
+      
+      // Use WebSocket data only if it exists AND is fresh (less than 5 seconds old)
+      if (lastRecordedPrice && timeSinceUpdate < STALE_THRESHOLD) {
+        const ageSeconds = Math.round(timeSinceUpdate / 1000);
+        console.log(`Using fresh WebSocket data for ${symbol}: $${lastRecordedPrice} (${ageSeconds}s old)`);
+        return {
+          data: {
+            tickers: [{
+              symbol: symbol,
+              last_price: lastRecordedPrice.toString(),
+              volume_24h: "0",
+              change_24h: "0"
+            }]
+          },
+          source: 'websocket',
+          timestamp: lastUpdateTime,
+          age_seconds: ageSeconds
+        };
+      } else {
+        // WebSocket data is stale or missing - fetch fresh from API
+        const ageSeconds = lastRecordedPrice ? Math.round(timeSinceUpdate / 1000) : 'N/A';
+        console.log(`WebSocket data stale/missing for ${symbol} (${ageSeconds}s old), fetching fresh from API`);
+        const tickerData = await getTicker(symbol);
+        const freshPrice = parseFloat(tickerData.data.tickers[0].last_price);
+        
+        // Update the cached price with fresh data
+        state.lastRecordedPrices[symbol] = freshPrice;
+        state.lastRecordedPrices[`${symbol}_timestamp`] = Date.now();
+        
+        return {
+          ...tickerData,
+          source: 'api_fresh',
+          timestamp: Date.now(),
+          was_stale: true,
+          stale_age_seconds: ageSeconds
+        };
+      }
+    } catch (error) {
+      console.error("Error fetching real-time ticker:", error);
+      throw error;
+    }
+  }
+
+  @Get("realtime-price")
+  @UseGuards(AuthGuard)
+  async getRealtimePrice(
+    @Query("symbol") symbol: string,
+    @Req() req: RequestWithUser
+  ): Promise<{ price: number; source: string; timestamp: number }> {
+    console.log("Received request for real-time price with symbol:", symbol);
+    if (!symbol) {
+      console.error("Error: Symbol query parameter is required");
+      throw new Error("Symbol query parameter is required");
+    }
+    try {
+      if (!req.user) {
+        throw new Error("User not authenticated");
+      }
+      
+      // Get real-time price from multiple sources (Binance, CoinGecko, etc.)
+      const price = await this.tradingService.fetchRealtimePrice(symbol, req.user.id);
+      
+      console.log("Real-time price for symbol:", symbol, "Price:", price);
+      return {
+        price: price,
+        source: 'aggregated_multiple_sources',
+        timestamp: Date.now()
+      };
+    } catch (error) {
+      console.error("Error fetching real-time price:", error);
+      throw error;
+    }
+  }
+
   @Get("order-book")
   async getOrderBook(@Query("symbol") symbol: string): Promise<any> {
     console.log("Received request for order book with symbol:", symbol);
